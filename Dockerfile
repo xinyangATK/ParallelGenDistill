@@ -30,10 +30,16 @@
 # =============================================================================
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 
+# PyPI access: the failed build timed out fetching /simple/httpcore/ from pypi.org
+# (read timeout=15s) and exhausted retries, which pip then mis-reported as a
+# dependency conflict. Keep the default index (pypi.org — build runs in the US),
+# just bump timeout/retries so a transient slow response can't kill the build.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    HF_HUB_ENABLE_HF_TRANSFER=1
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10
 
 # --- 1. System deps: toolchain + Python 3.12 + GL/glib (opencv/vision) + IB. ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -74,11 +80,12 @@ RUN pip install -r verl/requirements.txt
 
 # --- 4. flash_attn: rmpad's `flash_attn.bert_padding` is hard-imported by the
 #     trainer and is NOT a verl/sglang dep. Depends only on torch (already
-#     present), so it sits in this stable pre-source layer. Prefer the prebuilt
-#     cp312 / torch2.9 / cu12 wheel; fall back to a (slow) source build if the
-#     wheel name ever drifts. ---
-RUN pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" \
-    || MAX_JOBS=4 pip install flash-attn==2.8.3 --no-build-isolation
+#     present). wget the prebuilt wheel matching this stack — 2.8.3 / cu12 /
+#     torch2.9 / cxx11abiTRUE / cp312, verified against torch 2.9.1+cu128
+#     (_GLIBCXX_USE_CXX11_ABI=True) — then install it. ---
+RUN wget -nv https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl && \
+    pip install --no-cache-dir flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl && \
+    rm flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 
 # --- 5. verl SOURCE (changes often). COPYed last + registered `--no-deps -e .`
 #     so editing verl only re-runs this cheap layer. `--no-deps` keeps the pinned
