@@ -1,0 +1,13 @@
+# W&B API key for the Draft-OPD AMLT job — TEMPLATE (no real secret committed here).
+#
+# The job logs OFFLINE by default (the training script forces WANDB_MODE=offline),
+# so runs are written to $WANDB_DIR on the blob and can be synced afterwards with
+# `wandb sync <run-dir>`. The key below is only needed if you switch to online mode.
+#
+# How the job gets the key (it reads the blob secret store, NOT this file):
+#   1. Upload a populated copy to the blob secret path the job sources:
+#        <blob>/secret/wandb_key.sh        (e.g. /blob/t-xinyangliu/secret/wandb_key.sh)
+#   2. Or copy this file to amlt/wandb_key.sh (gitignored) and source it yourself.
+#
+# Get your key at: https://wandb.ai/authorize
+export WANDB_API_KEY="REPLACE_WITH_YOUR_WANDB_KEY"

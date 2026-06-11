@@ -1,0 +1,37 @@
+# Files excluded from the AMLT `code` upload (code.local_dir = repo root).
+# Keeps the upload small — the cluster image already provides the heavy binaries.
+
+.git/
+.nested-git-backups/
+.claude/
+
+# Never upload the real W&B key or local run artifacts
+amlt/wandb_key.sh
+wandb/
+wandb_offline/
+outputs/
+checkpoints/
+*.log
+
+# Python / build caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
+
+# Big binaries — provided by the image, not the code upload
+*.whl
+*.so
+*.o
+*.a
+*.pt
+*.bin
+*.safetensors
+
+# Local-only flash_attn shim (disabled hack; not needed on the cluster)
+flash_attn_shim/

@@ -24,7 +24,7 @@ if [[ -z "${DRAFT_MODELS_CSV}" ]]; then
 fi
 
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=${SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN:-1}
-export HF_HOME=${HF_HOME:-""} # your Hugging Face cache path.
+export HF_HOME=${HF_HOME:-"/data/xyliu/cache/draftopd/hf_cache"} # your Hugging Face cache path.
 if [[ -n "${HF_HOME}" ]]; then
   export HF_HUB_CACHE=${HF_HUB_CACHE:-"${HF_HOME}/hub"}
   export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-"${HF_HOME}/datasets"}

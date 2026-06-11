@@ -1,0 +1,28 @@
+# Minimal single-GPU SGLang eval for z-lab/Qwen3-4B-DFlash-b16 on Qwen/Qwen3-4B.
+#   conda activate draftopd
+#   cd diffusion/dflash
+#   HF_HOME=/data/xyliu/hf_cache HF_HUB_OFFLINE=0 HF_DATASETS_OFFLINE=0 \
+#     bash sglang_run_bench.sh --config-yaml eval_config/draftopd_zlab_b16.yaml
+#
+# speculative_algorithm is auto-inferred as DFLASH; block_size (b16) is read from
+# the draft model config (defaults to 16). eagle_topk is forced to 1 by the server.
+
+
+########
+# Draft model:
+# bingyang-lei/Qwen3-4B-Ins-Draft-OPD
+
+jobs:
+  - name: gpu0
+    gpu: 0
+    target_model: Qwen/Qwen3-4B            # HF id or local path
+    draft_model: bingyang-lei/Qwen3-4B-Ins-Draft-OPD # z-lab/Qwen3-4B-DFlash-b16 # HF id or local path
+    output_md: sglang-logs/draftopd_4b_b16.md
+    dataset_name: ["gsm8k:128", "math500:128"]  # small subset for first run
+    concurrency_num: "1"     # set "1,2,4" to see speedup-vs-concurrency curve
+    add_base: false           # also run target-only baseline -> reports speedup ratio
+    enable_think: false
+    attention_backends: fa3
+    max_new_tokens: 8192
+    tp_size: 1
+    mem_fraction_static: 0.75

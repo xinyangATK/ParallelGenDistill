@@ -3,12 +3,19 @@
 !/.gitignore
 !/README.md
 !/install.sh
+!/amlt/
+!/.amltignore
+!/Dockerfile
+!/.dockerignore
 !/verl/
 !/sglang-dflash/
 !/diffusion/
 !/fig/
 /fig/*
 !/fig/overview-draft-opd.jpg
+
+# AMLT: publish the job spec + wandb template, but never the real W&B key.
+/amlt/wandb_key.sh
 
 # Ignore top-level workspace scripts; child repository files are unaffected.
 /*.py

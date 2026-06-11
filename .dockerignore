@@ -1,0 +1,26 @@
+# Keep the Docker build context small (mirrors .amltignore).
+.git
+**/.git
+.nested-git-backups/
+.claude/
+
+# Secrets + local run artifacts
+amlt/wandb_key.sh
+wandb/
+wandb_offline/
+outputs/
+checkpoints/
+*.log
+
+# Caches / build artifacts (the image installs everything fresh)
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.egg-info/
+**/build/
+**/dist/
+*.whl
+**/*.so
+
+# Local-only flash_attn shim (disabled hack; not needed in the image)
+flash_attn_shim/

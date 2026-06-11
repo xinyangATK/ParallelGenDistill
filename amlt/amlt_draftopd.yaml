@@ -1,0 +1,132 @@
+description: Draft-OPD — DFlash on-policy distillation (Qwen3-4B teacher -> DFlash draft)
+# ---------------------------------------------------------------------------
+# Usage (from the repo root, in your `amlt` conda env):
+#
+#   amlt run amlt/amlt_draftopd.yaml <experiment_name>
+#
+# Override the SKU or any knob at submit time, e.g.:
+#   SLA=Premium amlt run amlt/amlt_draftopd.yaml draftopd_premium --yes
+#   LR=1e-4 MAX_RESPONSE_LENGTH=2048 amlt run amlt/amlt_draftopd.yaml draftopd_lr1e4 --yes
+#   GPUS=4 NVLINK_SUFFIX="" amlt run amlt/amlt_draftopd.yaml draftopd_4gpu --yes
+#
+# IMPORTANT — image, data, and W&B must be set up first:
+#
+#  1. IMAGE: this job needs an image with the Draft-OPD stack
+#     (Python 3.12 / torch 2.9.1+cu128 / sgl-kernel 0.3.21 / flashinfer 0.6.4 and a
+#     CUDA runtime consistent with torch's cu128 wheels). The reference `opd-verl06`
+#     image is the WRONG stack — build the image from ./Dockerfile at the repo root
+#     and set `environment.image` below. The uploaded repo's editable installs
+#     (sglang-dflash + verl) are re-applied at runtime so the code matches this checkout.
+#
+#  2. DATA: the OPD train pool + val sets are locally-built jsonl (NOT on the HF Hub).
+#     Upload them to the mounted blob first, then point TRAIN_JSONL / VAL_FILES at
+#     the mount (defaults below assume this layout under the blob root):
+#       <blob>/data/draftopd/opd_16k/opd_pool_16k.jsonl
+#       <blob>/data/draftopd/val/{aime24,gsm8k,math500,mbpp}.jsonl
+#     Models (Qwen/Qwen3-4B, z-lab/Qwen3-4B-DFlash-b16) are pulled from the HF Hub
+#     into $HF_HOME on the blob (cached across runs).
+#
+#  3. W&B: the inner script forces WANDB_MODE=offline, so runs log to $WANDB_DIR on
+#     the blob (sync later with `wandb sync <run-dir>`). To also have the key
+#     available (e.g. if you flip to online), upload it to <blob>/secret/wandb_key.sh
+#     — see amlt/wandb_key.sh.example. The key is NEVER committed to this repo.
+# ---------------------------------------------------------------------------
+
+env_defaults:
+  SLA: Standard                 # Premium for guaranteed A100-80G capacity
+  NODES: 1
+  GPUS: 8                       # (GPUS-TEACHER_WORLD_SIZE) student + TEACHER_WORLD_SIZE teacher, one node
+  MEM: 80                       # A100-80G
+  NVLINK_SUFFIX: "-NvLink"      # "-NvLink" for GPUS=8; "" for GPUS in {1,2,4}
+  TEACHER_WORLD_SIZE: 1         # teacher SGLang inference-pool GPUs; the student gets the rest
+
+  # ---- Models (HF ids, auto-cached into $HF_HOME; or blob paths) ----
+  MAIN_MODEL_PATH: Qwen/Qwen3-4B
+  DRAFT_MODEL_PATH: z-lab/Qwen3-4B-DFlash-b16    # warm-start; swap for your own initial draft
+
+  # ---- Data (full paths on the mounted blob; edit to match your upload) ----
+  TRAIN_JSONL: /blob/t-xinyangliu/data/draftopd/opd_16k/opd_pool_16k.jsonl
+  VAL_FILES: "['/blob/t-xinyangliu/data/draftopd/val/aime24.jsonl','/blob/t-xinyangliu/data/draftopd/val/gsm8k.jsonl','/blob/t-xinyangliu/data/draftopd/val/math500.jsonl','/blob/t-xinyangliu/data/draftopd/val/mbpp.jsonl']"
+
+  # ---- Training knobs (read by run_qwen_gsm8k_forward-ins.sh) ----
+  LR: 3e-4
+  MAX_RESPONSE_LENGTH: 4096
+  DISTILLATION_LOSS_MODE: k3
+  FORWARD_KL_WEIGHT: 1.0
+  REVERSE_KL_WEIGHT: 0.0
+  train_epochs: 8
+
+  # ---- Attention impl (sdpa is portable + proven; on Hopper you may use flex/flash) ----
+  ATTN_IMPL: sdpa
+  DFLASH_ATTN_IMPL: sdpa
+
+target:
+  service: sing
+  name: GenAI-Shared-UKSouth2
+  workspace_name: Singularity-GenAI-WS-UKSouth2
+  resource_group: singularity-genai-gpu-uksouth2
+
+code:
+  local_dir: ./                 # upload the repo root (this yaml lives in amlt/); see .amltignore
+
+storage:
+  data:
+    storage_account_name: vigstandard
+    container_name: data
+    mount_dir: /blob
+    is_output: true             # persist checkpoints / wandb / hf cache back to the blob
+
+environment:
+  image: <FILL_IN_DRAFTOPD_IMAGE>      # <-- e.g. 44359f3e...azurecr.io/draft-opd/draft-opd:latest (py3.12 / torch2.9.1+cu128). See header note #1.
+  username: 44359f3e6e864ddba0853a221be97722
+  registry: 44359f3e6e864ddba0853a221be97722.azurecr.io
+  env:
+    AMLT_DOCKERFILE_TEMPLATE: none
+
+jobs:
+  - name: draftopd_dflash_opd
+    sku: ${NODES}x${MEM}G${GPUS}${NVLINK_SUFFIX}
+    sla_tier: ${SLA}
+    priority: high
+    mpi: False
+    process_count_per_node: 1            # verl spawns its own single-node Ray cluster
+    command:
+      # Run from the uploaded code dir so relative paths (amlt/..., verl/...) resolve.
+      - cd $$AMLT_CODE_DIR
+      # ---- Paths rooted on the mounted blob (checkpoints / cache / logs persist) ----
+      - export AZURE_STORAGE_ROOT=$${AZURE_STORAGE_ROOT:-/blob/t-xinyangliu}
+      - export OUTPUT_ROOT=$${OUTPUT_ROOT:-$${AZURE_STORAGE_ROOT}/outputs/$${AMLT_JOB_NAME}/$${AMLT_EXPERIMENT_NAME}}
+      - export HF_HOME=$${HF_HOME:-$${AZURE_STORAGE_ROOT}/cache/hf}
+      - export CKPT_DIR=$${CKPT_DIR:-$${OUTPUT_ROOT}/checkpoints}
+      - export WANDB_DIR=$${WANDB_DIR:-$${OUTPUT_ROOT}/wandb}
+      # ---- W&B key (kept off the public repo; offline by default — see header note #3) ----
+      - set +x 2>/dev/null; source $${AZURE_STORAGE_ROOT}/secret/wandb_key.sh 2>/dev/null || true
+      # ---- Make the UPLOADED checkout the active install (uploaded dir != image workdir) ----
+      - pip install --no-deps -e ./sglang-dflash/python -e ./verl
+      - export PYTHONUNBUFFERED=1
+      # ---- GPU split: TEACHER_WORLD_SIZE teacher GPUs, the rest for the student ----
+      - export TEACHER_WORLD_SIZE=${TEACHER_WORLD_SIZE}
+      - export STUDENT_WORLD_SIZE=$$(( ${GPUS} - ${TEACHER_WORLD_SIZE} ))
+      # ---- Models + training knobs the entrypoint reads from the environment ----
+      - export MAIN_MODEL_PATH="${MAIN_MODEL_PATH}"
+      - export DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH}"
+      - export MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH}
+      - export LR=${LR}
+      - export DISTILLATION_LOSS_MODE=${DISTILLATION_LOSS_MODE}
+      - export FORWARD_KL_WEIGHT=${FORWARD_KL_WEIGHT}
+      - export REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT}
+      - export train_epochs=${train_epochs}
+      - export EXP_NAME=$${AMLT_EXPERIMENT_NAME:-draftopd}
+      # ---- Data (uploaded to the blob; fail early with a clear message if missing) ----
+      - export TRAIN_JSONL="${TRAIN_JSONL}"
+      - export VAL_FILES="${VAL_FILES}"
+      - test -f "$${TRAIN_JSONL}" || { echo "[ERR] TRAIN_JSONL not found on blob: $${TRAIN_JSONL} — upload your jsonl first (see header note #2)."; exit 1; }
+      # ---- Pre-cache HF models once (best-effort; trainer downloads on demand otherwise) ----
+      - hf download "${MAIN_MODEL_PATH}" >/dev/null 2>&1 || true
+      - hf download "${DRAFT_MODEL_PATH}" >/dev/null 2>&1 || true
+      # ---- Run ----
+      - bash verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh "data.val_files=$${VAL_FILES}" "++actor_rollout_ref.model.override_config.attn_implementation=${ATTN_IMPL}" "++actor_rollout_ref.model.override_config.verl_dflash_attention_impl=${DFLASH_ATTN_IMPL}"
+    submit_args:
+      env:
+        DATASET_MOUNT_BLOCK_BASED_CACHE_ENABLED: True
+        SHARED_MEMORY_PERCENT: 0.5
