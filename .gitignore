@@ -11,6 +11,11 @@
 !/sglang-dflash/
 !/diffusion/
 !/data_prep/
+# data_prep: track the pipeline script only. The pool / manifest / hf cache are
+# built on the blob at job time (see amlt_draftopd.yaml), never committed.
+/data_prep/*.jsonl
+/data_prep/manifest.json
+/data_prep/hf_cache/
 !/fig/
 /fig/*
 !/fig/overview-draft-opd.jpg

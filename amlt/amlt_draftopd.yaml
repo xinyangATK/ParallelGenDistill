@@ -18,13 +18,18 @@ description: Draft-OPD — DFlash on-policy distillation (Qwen3-4B teacher -> DF
 #     and set `environment.image` below. The uploaded repo's editable installs
 #     (sglang-dflash + verl) are re-applied at runtime so the code matches this checkout.
 #
-#  2. DATA: the OPD train pool + val sets are locally-built jsonl (NOT on the HF Hub).
-#     Upload them to the mounted blob first, then point TRAIN_JSONL / VAL_FILES at
-#     the mount (defaults below assume this layout under the blob root):
-#       <blob>/data/draftopd/opd_16k/opd_pool_16k.jsonl
-#       <blob>/data/draftopd/val/{aime24,gsm8k,math500,mbpp}.jsonl
-#     Models (Qwen/Qwen3-4B, z-lab/Qwen3-4B-DFlash-b16) are pulled from the HF Hub
-#     into $HF_HOME on the blob (cached across runs).
+#  2. DATA:
+#     - TRAIN: the 16K pool is BUILT ON THE BLOB at job time by
+#       data_prep/prepare_opd_pool.py — first run downloads the 4 sources from HF and
+#       writes $DATA_ROOT/opd_pool_16k.jsonl; later runs reuse it (build skipped).
+#       $DATA_ROOT defaults to $AZURE_STORAGE_ROOT/data/draftopd (i.e.
+#       /blob/t-xinyangliu/data/draftopd). Optionally pre-stage the raw sources under
+#       $DATA_ROOT/{gsm8k,math,aops,codealpaca} to skip the HF download.
+#     - VAL: the 4 val sets ship in the repo (data_prep/val/, ~1MB) and upload with
+#       the code, so they are ready before the first run. VAL_DIR defaults to
+#       $AMLT_CODE_DIR/data_prep/val; override it to a blob path if you prefer.
+#     Models (Qwen/Qwen3-4B, z-lab/Qwen3-4B-DFlash-b16) are pulled from HF into
+#     $HF_HOME on the blob (cached across runs).
 #
 #  3. W&B: the inner script forces WANDB_MODE=offline, so runs log to $WANDB_DIR on
 #     the blob (sync later with `wandb sync <run-dir>`). To also have the key
@@ -33,20 +38,20 @@ description: Draft-OPD — DFlash on-policy distillation (Qwen3-4B teacher -> DF
 # ---------------------------------------------------------------------------
 
 env_defaults:
-  SLA: Standard                 # Premium for guaranteed A100-80G capacity
+  SLA: Premium                 # Premium for guaranteed A100-80G capacity
   NODES: 1
   GPUS: 8                       # (GPUS-TEACHER_WORLD_SIZE) student + TEACHER_WORLD_SIZE teacher, one node
   MEM: 80                       # A100-80G
-  NVLINK_SUFFIX: "-NvLink"      # "-NvLink" for GPUS=8; "" for GPUS in {1,2,4}
+  NVLINK_SUFFIX: ""      # "-NvLink" for GPUS=8; "" for GPUS in {1,2,4}
   TEACHER_WORLD_SIZE: 1         # teacher SGLang inference-pool GPUs; the student gets the rest
 
   # ---- Models (HF ids, auto-cached into $HF_HOME; or blob paths) ----
   MAIN_MODEL_PATH: Qwen/Qwen3-4B
   DRAFT_MODEL_PATH: z-lab/Qwen3-4B-DFlash-b16    # warm-start; swap for your own initial draft
 
-  # ---- Data (full paths on the mounted blob; edit to match your upload) ----
-  TRAIN_JSONL: /blob/t-xinyangliu/data/draftopd/opd_16k/opd_pool_16k.jsonl
-  VAL_FILES: "['/blob/t-xinyangliu/data/draftopd/val/aime24.jsonl','/blob/t-xinyangliu/data/draftopd/val/gsm8k.jsonl','/blob/t-xinyangliu/data/draftopd/val/math500.jsonl','/blob/t-xinyangliu/data/draftopd/val/mbpp.jsonl']"
+  # ---- Data: train pool is BUILT on the blob by data_prep at job time (reused if
+  #      present); the 4 val sets ship in the repo (data_prep/val/) and upload with
+  #      the code, so they are ready before the first run. ----
 
   # ---- Training knobs (read by run_qwen_gsm8k_forward-ins.sh) ----
   LR: 3e-4
@@ -117,10 +122,16 @@ jobs:
       - export REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT}
       - export train_epochs=${train_epochs}
       - export EXP_NAME=$${AMLT_EXPERIMENT_NAME:-draftopd}
-      # ---- Data (uploaded to the blob; fail early with a clear message if missing) ----
-      - export TRAIN_JSONL="${TRAIN_JSONL}"
-      - export VAL_FILES="${VAL_FILES}"
-      - test -f "$${TRAIN_JSONL}" || { echo "[ERR] TRAIN_JSONL not found on blob: $${TRAIN_JSONL} — upload your jsonl first (see header note #2)."; exit 1; }
+      # ---- OPD train pool: build it on the blob via data_prep on the first run;
+      #      reuse it (skip download+build) on every later run. Raw sources are pulled
+      #      from HF the first time unless pre-staged under $DATA_ROOT. ----
+      - export DATA_ROOT=$${DATA_ROOT:-$${AZURE_STORAGE_ROOT}/data/draftopd}
+      - export TRAIN_JSONL=$${DATA_ROOT}/opd_pool_16k.jsonl
+      # val sets ship in the repo (data_prep/val/), uploaded with the code -> ready on run 1
+      - export VAL_DIR=$${VAL_DIR:-$${AMLT_CODE_DIR}/data_prep/val}
+      - export VAL_FILES="['$${VAL_DIR}/aime24.jsonl','$${VAL_DIR}/gsm8k.jsonl','$${VAL_DIR}/math500.jsonl','$${VAL_DIR}/mbpp.jsonl']"
+      - if [ -f "$${TRAIN_JSONL}" ]; then echo "[data] reuse existing pool: $${TRAIN_JSONL}"; else echo "[data] building pool on blob -> $${TRAIN_JSONL}"; python data_prep/prepare_opd_pool.py "$${DATA_ROOT}" --raw-dir "$${DATA_ROOT}"; fi
+      - test -f "$${TRAIN_JSONL}" || { echo "[ERR] pool missing after build: $${TRAIN_JSONL}"; exit 1; }
       # ---- Pre-cache HF models once (best-effort; trainer downloads on demand otherwise) ----
       - hf download "${MAIN_MODEL_PATH}" >/dev/null 2>&1 || true
       - hf download "${DRAFT_MODEL_PATH}" >/dev/null 2>&1 || true
