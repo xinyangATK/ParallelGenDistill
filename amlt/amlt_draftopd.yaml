@@ -55,7 +55,7 @@ env_defaults:
 
   # ---- Training knobs (read by run_qwen_gsm8k_forward-ins.sh) ----
   LR: 3e-4
-  MAX_RESPONSE_LENGTH: 4096
+  MAX_RESPONSE_LENGTH: 2048
   DISTILLATION_LOSS_MODE: k3
   FORWARD_KL_WEIGHT: 1.0
   REVERSE_KL_WEIGHT: 0.0
