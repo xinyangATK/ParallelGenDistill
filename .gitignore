@@ -10,6 +10,7 @@
 !/verl/
 !/sglang-dflash/
 !/diffusion/
+!/data_prep/
 !/fig/
 /fig/*
 !/fig/overview-draft-opd.jpg
