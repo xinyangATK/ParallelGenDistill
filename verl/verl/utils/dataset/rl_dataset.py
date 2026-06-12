@@ -34,6 +34,14 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 from verl.utils.import_utils import load_extern_object
 from verl.utils.tokenizer import normalize_token_ids
 
+# blobfuse's statvfs misreports 0 free space on the Azure blob mount, so datasets'
+# pre-download disk-space check raises "Not enough disk space" even though the actual
+# arrow-cache writes succeed. Neutralize the broken pre-check (the cache may live on the
+# blob or on local scratch); see amlt_draftopd.yaml.
+import datasets.builder as _datasets_builder  # noqa: E402
+
+_datasets_builder.has_sufficient_disk_space = lambda *args, **kwargs: True
+
 logger = logging.getLogger(__name__)
 
 
