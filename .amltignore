@@ -13,10 +13,8 @@ outputs/
 checkpoints/
 *.log
 
-# data_prep: the 27M train pool is built on the blob at job time, not uploaded.
-# (data_prep/val/ is small and SHOULD upload, so it is NOT excluded here.)
-/data_prep/opd_pool_16k.jsonl
-/data_prep/manifest.json
+# data_prep: upload the prebuilt pool + val sets with the code (no blob build).
+# Only the transient HF cache is excluded.
 /data_prep/hf_cache/
 
 # Python / build caches

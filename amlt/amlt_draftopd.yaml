@@ -18,16 +18,11 @@ description: Draft-OPD without sftwarmup
 #     and set `environment.image` below. The uploaded repo's editable installs
 #     (sglang-dflash + verl) are re-applied at runtime so the code matches this checkout.
 #
-#  2. DATA:
-#     - TRAIN: the 16K pool is BUILT ON THE BLOB at job time by
-#       data_prep/prepare_opd_pool.py — first run downloads the 4 sources from HF and
-#       writes $DATA_ROOT/opd_pool_16k.jsonl; later runs reuse it (build skipped).
-#       $DATA_ROOT defaults to $AZURE_STORAGE_ROOT/data/draftopd (i.e.
-#       /blob/t-xinyangliu/data/draftopd). Optionally pre-stage the raw sources under
-#       $DATA_ROOT/{gsm8k,math,aops,codealpaca} to skip the HF download.
-#     - VAL: the 4 val sets ship in the repo (data_prep/val/, ~1MB) and upload with
-#       the code, so they are ready before the first run. VAL_DIR defaults to
-#       $AMLT_CODE_DIR/data_prep/val; override it to a blob path if you prefer.
+#  2. DATA: both the prebuilt 16K train pool (data_prep/opd_pool_16k.jsonl, ~27MB) and
+#     the 4 val sets (data_prep/val/, ~1MB) ship in the repo and upload with the code,
+#     so the job needs NO blob build and NO HF data download. TRAIN_JSONL / VAL_DIR
+#     default to $AMLT_CODE_DIR/data_prep/... To regenerate the pool, run
+#     data_prep/prepare_opd_pool.py locally and re-commit it.
 #     Models (Qwen/Qwen3-4B, z-lab/Qwen3-4B-DFlash-b16) are pulled from HF into
 #     $HF_HOME on the blob (cached across runs).
 #
@@ -124,19 +119,13 @@ jobs:
       - export REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT}
       - export train_epochs=${train_epochs}
       - export EXP_NAME=$${AMLT_EXPERIMENT_NAME:-draftopd}
-      # ---- OPD train pool: build it on the blob via data_prep on the first run;
-      #      reuse it (skip download+build) on every later run. Raw sources are pulled
-      #      from HF the first time unless pre-staged under $DATA_ROOT. ----
-      - export DATA_ROOT=$${DATA_ROOT:-$${AZURE_STORAGE_ROOT}/data/draftopd}
-      - export TRAIN_JSONL=$${DATA_ROOT}/opd_pool_16k.jsonl
+      # ---- OPD train pool: prebuilt and BUNDLED in the repo (data_prep/), uploaded with
+      #      the code like the val sets — no blob build / no HF data download at job time. ----
+      - export TRAIN_JSONL=$${AMLT_CODE_DIR}/data_prep/opd_pool_16k.jsonl
       # val sets ship in the repo (data_prep/val/), uploaded with the code -> ready on run 1
       - export VAL_DIR=$${VAL_DIR:-$${AMLT_CODE_DIR}/data_prep/val}
       - export VAL_FILES="['$${VAL_DIR}/aime24.jsonl','$${VAL_DIR}/gsm8k.jsonl','$${VAL_DIR}/math500.jsonl','$${VAL_DIR}/mbpp.jsonl']"
-      # (Re)build the pool every submit (verl06-style, no skip). HF download + datasets
-      # cache go to $DATA_ROOT/hf_cache on the blob (prepare's default) and are reused by
-      # datasets across runs; the pool is written to $DATA_ROOT/opd_pool_16k.jsonl.
-      - 'echo "[data] building pool -> $${TRAIN_JSONL}"; python data_prep/prepare_opd_pool.py "$${DATA_ROOT}" --raw-dir "$${DATA_ROOT}"'
-      - 'test -f "$${TRAIN_JSONL}" || { echo "[ERR] pool missing after build: $${TRAIN_JSONL}"; exit 1; }'
+      - 'test -f "$${TRAIN_JSONL}" || { echo "[ERR] bundled pool missing (data_prep/opd_pool_16k.jsonl not uploaded?): $${TRAIN_JSONL}"; exit 1; }'
       # ---- Pre-cache HF models once (best-effort; trainer downloads on demand otherwise) ----
       - hf download "${MAIN_MODEL_PATH}" >/dev/null 2>&1 || true
       - hf download "${DRAFT_MODEL_PATH}" >/dev/null 2>&1 || true
