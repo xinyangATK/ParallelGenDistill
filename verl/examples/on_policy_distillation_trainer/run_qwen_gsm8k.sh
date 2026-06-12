@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 unset RAY_ADDRESS
-pkill -9 ray
-pkill -9 python
-sleep 1
+# Local cleanup of leftover ray/python from a previous run. SKIP on amlt/cluster:
+# `pkill -9 python` there also kills amlt-code-runner's own monitor process, which
+# tears the job down with SIGKILL (no traceback) right after the trainer launches.
+if [ -z "${AMLT_CODE_DIR:-}" ]; then
+  pkill -9 ray
+  pkill -9 python
+  sleep 1
+fi
 export RAY_ADDRESS=local
 set -xeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
