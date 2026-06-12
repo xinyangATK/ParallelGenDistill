@@ -132,10 +132,10 @@ jobs:
       # val sets ship in the repo (data_prep/val/), uploaded with the code -> ready on run 1
       - export VAL_DIR=$${VAL_DIR:-$${AMLT_CODE_DIR}/data_prep/val}
       - export VAL_FILES="['$${VAL_DIR}/aime24.jsonl','$${VAL_DIR}/gsm8k.jsonl','$${VAL_DIR}/math500.jsonl','$${VAL_DIR}/mbpp.jsonl']"
-      # Write the pool straight to the blob, but keep the HF datasets CACHE on local scratch:
-      # blobfuse's statvfs misreports 0 free space and `datasets` hard-refuses its pre-download
-      # check, whereas plain file writes to the blob work (same as opd_verl06's `hf download`).
-      - 'if [ -f "$${TRAIN_JSONL}" ]; then echo "[data] reuse existing pool: $${TRAIN_JSONL}"; else echo "[data] building pool -> $${TRAIN_JSONL}"; python data_prep/prepare_opd_pool.py "$${DATA_ROOT}" --raw-dir "$${DATA_ROOT}" --cache-dir /scratch/opd_hf_cache; fi'
+      # (Re)build the pool every submit (verl06-style, no skip). HF download + datasets
+      # cache go to $DATA_ROOT/hf_cache on the blob (prepare's default) and are reused by
+      # datasets across runs; the pool is written to $DATA_ROOT/opd_pool_16k.jsonl.
+      - 'echo "[data] building pool -> $${TRAIN_JSONL}"; python data_prep/prepare_opd_pool.py "$${DATA_ROOT}" --raw-dir "$${DATA_ROOT}"'
       - 'test -f "$${TRAIN_JSONL}" || { echo "[ERR] pool missing after build: $${TRAIN_JSONL}"; exit 1; }'
       # ---- Pre-cache HF models once (best-effort; trainer downloads on demand otherwise) ----
       - hf download "${MAIN_MODEL_PATH}" >/dev/null 2>&1 || true
