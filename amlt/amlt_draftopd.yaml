@@ -56,10 +56,6 @@ env_defaults:
   REVERSE_KL_WEIGHT: 0.0
   train_epochs: 8
 
-  # ---- Attention impl (sdpa is portable + proven; on Hopper you may use flex/flash) ----
-  ATTN_IMPL: sdpa
-  DFLASH_ATTN_IMPL: sdpa
-
 target:
   service: sing
   name: GenAI-Shared-UKSouth2
@@ -130,7 +126,7 @@ jobs:
       - hf download "${MAIN_MODEL_PATH}" >/dev/null 2>&1 || true
       - hf download "${DRAFT_MODEL_PATH}" >/dev/null 2>&1 || true
       # ---- Run ----
-      - bash verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh "data.val_files=$${VAL_FILES}" "++actor_rollout_ref.model.override_config.attn_implementation=${ATTN_IMPL}" "++actor_rollout_ref.model.override_config.verl_dflash_attention_impl=${DFLASH_ATTN_IMPL}"
+      - bash verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh "data.val_files=$${VAL_FILES}"
     submit_args:
       env:
         DATASET_MOUNT_BLOCK_BASED_CACHE_ENABLED: True
