@@ -42,7 +42,7 @@ env_defaults:
   NODES: 1
   GPUS: 8                       # (GPUS-TEACHER_WORLD_SIZE) student + TEACHER_WORLD_SIZE teacher, one node
   MEM: 80                       # A100-80G
-  NVLINK_SUFFIX: ""      # "-NvLink" for GPUS=8; "" for GPUS in {1,2,4}
+  NVLINK_SUFFIX: "-NvLink"      # "-NvLink" for GPUS=8; "" for GPUS in {1,2,4}
   TEACHER_WORLD_SIZE: 1         # teacher SGLang inference-pool GPUs; the student gets the rest
 
   # ---- Models (HF ids, auto-cached into $HF_HOME; or blob paths) ----
@@ -82,7 +82,7 @@ storage:
     is_output: true             # persist checkpoints / wandb / hf cache back to the blob
 
 environment:
-  image: <FILL_IN_DRAFTOPD_IMAGE>      # <-- e.g. 44359f3e...azurecr.io/draft-opd/draft-opd:latest (py3.12 / torch2.9.1+cu128). See header note #1.
+  image: 44359f3e6e864ddba0853a221be97722.azurecr.io/draft-opd/draft-opd:latest   # py3.12 / torch2.9.1+cu128, built from ./Dockerfile. See header note #1.
   username: 44359f3e6e864ddba0853a221be97722
   registry: 44359f3e6e864ddba0853a221be97722.azurecr.io
   env:
