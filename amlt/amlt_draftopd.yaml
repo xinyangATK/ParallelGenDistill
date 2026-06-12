@@ -1,4 +1,4 @@
-description: Draft-OPD — DFlash on-policy distillation (Qwen3-4B teacher -> DFlash draft)
+description: Draft-OPD without sftwarmup
 # ---------------------------------------------------------------------------
 # Usage (from the repo root, in your `amlt` conda env):
 #
