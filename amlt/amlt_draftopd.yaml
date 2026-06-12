@@ -82,7 +82,7 @@ storage:
     is_output: true             # persist checkpoints / wandb / hf cache back to the blob
 
 environment:
-  image: 44359f3e6e864ddba0853a221be97722.azurecr.io/draft-opd/draft-opd:latest   # py3.12 / torch2.9.1+cu128, built from ./Dockerfile. See header note #1.
+  image: draft-opd/draft-opd:latest   # py3.12 / torch2.9.1+cu128, built from ./Dockerfile. See header note #1.
   username: 44359f3e6e864ddba0853a221be97722
   registry: 44359f3e6e864ddba0853a221be97722.azurecr.io
   env:
