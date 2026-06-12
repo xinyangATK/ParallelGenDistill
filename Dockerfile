@@ -41,19 +41,24 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DEFAULT_TIMEOUT=120 \
     PIP_RETRIES=10
 
-# --- 1. System deps: toolchain + Python 3.12 + GL/glib (opencv/vision) + IB. ---
+# --- 1. System deps: toolchain + Python 3.12 + GL/glib (opencv/vision) + IB +
+#       libnuma (sgl_kernel's common_ops.so links libnuma.so.1; missing it makes
+#       `import sgl_kernel` fail at rollout init with an ImportError). ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git wget curl ca-certificates build-essential ninja-build \
       python3.12 python3.12-dev python3.12-venv python3-pip \
-      libgl1 libglib2.0-0 \
+      libgl1 libglib2.0-0 libnuma1 \
       rdma-core ibverbs-providers libibverbs1 librdmacm1 ibverbs-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Isolated venv on PATH so `python` / `pip` at runtime hit this interpreter.
 RUN python3.12 -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
+# wrapt/azure-identity/python-dateutil: amlt-code-runner installs these at runtime via
+# `pip install --user`, which fails inside a venv. Pre-install them so it finds them present.
 RUN ln -sf /opt/venv/bin/python /usr/local/bin/python \
-    && pip install --upgrade pip setuptools wheel
+    && pip install --upgrade pip setuptools wheel \
+    && pip install wrapt azure-identity python-dateutil
 
 WORKDIR /workspace
 
