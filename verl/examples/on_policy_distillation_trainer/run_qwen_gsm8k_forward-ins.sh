@@ -42,7 +42,7 @@ TODAY=$(date +"%m-%d")
 EXP_NAME=${EXP_NAME:-"ins-lr-${LR}-random_anchor-${RANDOM_RESPONSE_ANCHOR_ENABLED}/student-teacher-${TODAY}/${DISTILLATION_LOSS_MODE}/enable-thinking-${ENABLE_THINKING}/train-${TRAIN_JSONL_NAME}-update-accumulation-steps"}
 CKPT_DIR=${CKPT_DIR:-"checkpoints/verl-dflash-opd/${EXP_NAME}"}
 
-exec "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
+exec bash "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     data.train_files="${TRAIN_FILES}" \
     data.max_prompt_length="${MAX_PROMPT}" \
     data.max_response_length="${MAX_RESPONSE_LENGTH}" \
