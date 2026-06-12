@@ -130,8 +130,8 @@ jobs:
       # val sets ship in the repo (data_prep/val/), uploaded with the code -> ready on run 1
       - export VAL_DIR=$${VAL_DIR:-$${AMLT_CODE_DIR}/data_prep/val}
       - export VAL_FILES="['$${VAL_DIR}/aime24.jsonl','$${VAL_DIR}/gsm8k.jsonl','$${VAL_DIR}/math500.jsonl','$${VAL_DIR}/mbpp.jsonl']"
-      - if [ -f "$${TRAIN_JSONL}" ]; then echo "[data] reuse existing pool: $${TRAIN_JSONL}"; else echo "[data] building pool on blob -> $${TRAIN_JSONL}"; python data_prep/prepare_opd_pool.py "$${DATA_ROOT}" --raw-dir "$${DATA_ROOT}"; fi
-      - test -f "$${TRAIN_JSONL}" || { echo "[ERR] pool missing after build: $${TRAIN_JSONL}"; exit 1; }
+      - 'if [ -f "$${TRAIN_JSONL}" ]; then echo "[data] reuse existing pool: $${TRAIN_JSONL}"; else echo "[data] building pool on blob -> $${TRAIN_JSONL}"; python data_prep/prepare_opd_pool.py "$${DATA_ROOT}" --raw-dir "$${DATA_ROOT}"; fi'
+      - 'test -f "$${TRAIN_JSONL}" || { echo "[ERR] pool missing after build: $${TRAIN_JSONL}"; exit 1; }'
       # ---- Pre-cache HF models once (best-effort; trainer downloads on demand otherwise) ----
       - hf download "${MAIN_MODEL_PATH}" >/dev/null 2>&1 || true
       - hf download "${DRAFT_MODEL_PATH}" >/dev/null 2>&1 || true
