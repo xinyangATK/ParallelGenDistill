@@ -41,3 +41,7 @@ dist/
 
 # Local-only flash_attn shim (disabled hack; not needed on the cluster)
 flash_attn_shim/
+
+# Dangling symlink (verl/CLAUDE.md -> AGENTS.md, target not vendored) breaks amlt's
+# source walk with ENOENT. It's an agent doc, irrelevant to training.
+/verl/CLAUDE.md
