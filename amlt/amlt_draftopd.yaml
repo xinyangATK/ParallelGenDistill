@@ -106,8 +106,10 @@ jobs:
       - export WANDB_DIR=$${WANDB_DIR:-$${OUTPUT_ROOT}/wandb}
       # ---- W&B key (kept off the public repo; offline by default — see header note #3) ----
       - set +x 2>/dev/null; source $${AZURE_STORAGE_ROOT}/secret/wandb_key.sh 2>/dev/null || true
-      # ---- Make the UPLOADED checkout the active install (uploaded dir != image workdir) ----
-      - pip install --no-deps -e ./sglang-dflash/python -e ./verl
+      # ---- No runtime editable reinstall (like opd_verl06): the image's /opt/venv is not
+      #      writable for the job user. The entrypoint cd's to verl/ and runs `python -m verl...`,
+      #      so the UPLOADED verl wins via cwd; sglang uses the image's baked editable install
+      #      (correct as long as sglang-dflash source is unchanged since the image build). ----
       - export PYTHONUNBUFFERED=1
       # ---- GPU split: TEACHER_WORLD_SIZE teacher GPUs, the rest for the student ----
       - export TEACHER_WORLD_SIZE=${TEACHER_WORLD_SIZE}
@@ -130,7 +132,10 @@ jobs:
       # val sets ship in the repo (data_prep/val/), uploaded with the code -> ready on run 1
       - export VAL_DIR=$${VAL_DIR:-$${AMLT_CODE_DIR}/data_prep/val}
       - export VAL_FILES="['$${VAL_DIR}/aime24.jsonl','$${VAL_DIR}/gsm8k.jsonl','$${VAL_DIR}/math500.jsonl','$${VAL_DIR}/mbpp.jsonl']"
-      - 'if [ -f "$${TRAIN_JSONL}" ]; then echo "[data] reuse existing pool: $${TRAIN_JSONL}"; else echo "[data] building pool on blob -> $${TRAIN_JSONL}"; python data_prep/prepare_opd_pool.py "$${DATA_ROOT}" --raw-dir "$${DATA_ROOT}"; fi'
+      # Write the pool straight to the blob, but keep the HF datasets CACHE on local scratch:
+      # blobfuse's statvfs misreports 0 free space and `datasets` hard-refuses its pre-download
+      # check, whereas plain file writes to the blob work (same as opd_verl06's `hf download`).
+      - 'if [ -f "$${TRAIN_JSONL}" ]; then echo "[data] reuse existing pool: $${TRAIN_JSONL}"; else echo "[data] building pool -> $${TRAIN_JSONL}"; python data_prep/prepare_opd_pool.py "$${DATA_ROOT}" --raw-dir "$${DATA_ROOT}" --cache-dir /scratch/opd_hf_cache; fi'
       - 'test -f "$${TRAIN_JSONL}" || { echo "[ERR] pool missing after build: $${TRAIN_JSONL}"; exit 1; }'
       # ---- Pre-cache HF models once (best-effort; trainer downloads on demand otherwise) ----
       - hf download "${MAIN_MODEL_PATH}" >/dev/null 2>&1 || true
