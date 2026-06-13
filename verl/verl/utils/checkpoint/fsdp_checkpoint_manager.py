@@ -231,6 +231,14 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
                 if self.should_save_model:
                     model_state_dict = self.model.state_dict()
+                    # OPD composed students (DFLASH/EAGLE3) wrap a FROZEN target under
+                    # `main_model.*` next to the trainable `draft_model.*`. The target is
+                    # identical every step and is always rebuilt from its HF path at init
+                    # (and loaded from HF at eval), so saving it just wastes disk/IO. Drop
+                    # it; this is a no-op for non-composed models (no `main_model.` keys).
+                    model_state_dict = {
+                        k: v for k, v in model_state_dict.items() if not k.startswith("main_model.")
+                    }
                     torch.save(model_state_dict, model_path)
                     log_with_rank(f"Saved model to {os.path.abspath(model_path)}", rank=self.rank, logger=logger)
 

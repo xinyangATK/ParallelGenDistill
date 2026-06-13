@@ -104,7 +104,10 @@ mapfile -t STEP_DIRS < <(
 )
 [ "${#STEP_DIRS[@]}" -gt 0 ] || { echo "[ERR] no global_step_* under ${CKPT_DIR}"; exit 1; }
 
-NAMES=(); DRAFTS=()
+# Eligible steps only (validity check; the actual draft extraction is done per-wave
+# below, just-in-time, so the GPU starts benchmarking after the first extract instead
+# of waiting for all of them).
+NAMES=(); ACTORS=(); DRAFTS=()
 for step_dir in "${STEP_DIRS[@]}"; do
   name="$(basename "${step_dir}")"; num="${name##*_}"
   [ -z "${STEPS:-}" ] || [ -n "${WANT[$num]:-}" ] || continue
@@ -112,24 +115,29 @@ for step_dir in "${STEP_DIRS[@]}"; do
   if [ ! -f "${actor}/fsdp_config.json" ]; then
     echo "[eval] skip ${name}: incomplete checkpoint (no actor/fsdp_config.json)"; continue
   fi
-  draft="${step_dir}/draft_model"
-  if [ "${REUSE_EXTRACTED}" = "true" ] && [ -f "${draft}/model.safetensors" ]; then
-    echo "[eval] reuse draft for ${name}: ${draft}"
-  else
-    echo "[eval] extract ${name} -> ${draft}"
-    python "${EXTRACT_PY}" --actor-dir "${actor}" --reference-draft-dir "${REF_DRAFT}" --target-dir "${draft}"
-  fi
-  NAMES+=("${name}"); DRAFTS+=("${draft}")
+  NAMES+=("${name}"); ACTORS+=("${actor}"); DRAFTS+=("${step_dir}/draft_model")
 done
 [ "${#NAMES[@]}" -gt 0 ] || { echo "[ERR] no checkpoints to eval"; exit 1; }
 
-# --- Run benchmarks in waves of SLOTS jobs (one sglang_run_bench.sh call per wave) ---
+# Merge one step's FSDP draft shards -> HF dir (skip if already extracted).
+extract_draft() {  # $1=name $2=actor_dir $3=draft_out
+  if [ "${REUSE_EXTRACTED}" = "true" ] && [ -f "$3/model.safetensors" ]; then
+    echo "[eval] reuse draft for $1: $3"
+  else
+    echo "[eval] extract $1 -> $3"
+    python "${EXTRACT_PY}" --actor-dir "$2" --reference-draft-dir "${REF_DRAFT}" --target-dir "$3"
+  fi
+}
+
+# --- Per wave: extract this wave's draft(s), then benchmark them (SLOTS jobs in
+#     parallel). For 1 GPU this is exactly "extract one, eval one". ---
 total=${#NAMES[@]}; i=0; wave=0
 while [ "${i}" -lt "${total}" ]; do
   cfg="${EVAL_LOG_DIR}/_wave_${wave}.yaml"
   echo "jobs:" > "${cfg}"
   slot=0
   while [ "${slot}" -lt "${SLOTS}" ] && [ "${i}" -lt "${total}" ]; do
+    extract_draft "${NAMES[$i]}" "${ACTORS[$i]}" "${DRAFTS[$i]}"
     start=$(( slot * TP_SIZE ))
     gpus="$(seq -s, "${start}" "$(( start + TP_SIZE - 1 ))")"
     {
