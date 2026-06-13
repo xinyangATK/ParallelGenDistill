@@ -1,0 +1,99 @@
+description: Draft-OPD SGLang eval (all step checkpoints)
+# ---------------------------------------------------------------------------
+# SGLang eval of EVERY saved DFLASH draft checkpoint of a Draft-OPD run, built on
+# diffusion/dflash/sglang_run_bench.sh. For each checkpoints/global_step_<N>/actor
+# it merges the draft -> global_step_<N>/draft_model (HF) and benchmarks it on
+# SGLang. GPU usage follows the SKU: one job == TP_SIZE GPU(s), packed into waves
+# of (GPUS / TP_SIZE) run in parallel — GPUS=1 evals sequentially, GPUS=8 evals 8
+# checkpoints at a time. Uses the SAME training image (sglang stack / libnuma).
+#
+# The job first downloads the eval datasets into the blob HF cache
+# (diffusion/dflash/prepare_eval_data.sh — idempotent, reused on later runs), then
+# runs the eval. Other bench knobs (concurrency, attention backend, max_new_tokens,
+# ...) are NOT set here — they fall through to the defaults in
+# diffusion/dflash/eval_checkpoints_sglang.sh, which mirror
+# eval_config/draftopd_zlab_b16.yaml. Change them by editing that script.
+#
+# Usage (name the TRAINING experiment whose checkpoints to eval == the name passed
+# to `amlt run amlt/amlt_draftopd.yaml <TRAIN_EXP_NAME>`):
+#
+#   TRAIN_EXP_NAME=<your_train_exp> amlt run amlt/amlt_draftopd_eval.yaml <eval_exp> --yes
+#   # parallel multi-GPU:
+#   TRAIN_EXP_NAME=myrun GPUS=8 NVLINK_SUFFIX="-NvLink" amlt run amlt/amlt_draftopd_eval.yaml myrun_eval --yes
+#   # explicit checkpoint dir (skip reconstruction):
+#   CKPT_DIR_OVERRIDE=/blob/.../checkpoints amlt run amlt/amlt_draftopd_eval.yaml myrun_eval --yes
+#
+# Reports + .run.log land next to the checkpoints (../eval_sglang/), reused on re-runs.
+# ---------------------------------------------------------------------------
+
+env_defaults:
+  SLA: Premium
+  NODES: 1
+  MEM: 80                       # A100-80G
+  GPUS: 1                       # 1 = sequential; set 8 to parallelize (one ckpt per GPU)
+  NVLINK_SUFFIX: ""             # "-NvLink" for GPUS=8; "" for GPUS in {1,2,4}
+
+  # ---- Which run to eval ----
+  TRAIN_JOB_NAME: draftopd_dflash_opd   # AMLT_JOB_NAME of the training job
+  TRAIN_EXP_NAME: ""                    # REQUIRED: training experiment name
+  CKPT_DIR_OVERRIDE: ""                 # optional: full path to dir holding global_step_*/
+
+  # ---- Datasets (shared by the data-prep step and the eval) ----
+  DATASETS_CSV: "gsm8k:128,math500:128"
+
+target:
+  service: sing
+  name: GenAI-Shared-UKSouth2
+  workspace_name: Singularity-GenAI-WS-UKSouth2
+  resource_group: singularity-genai-gpu-uksouth2
+
+code:
+  local_dir: ./                 # upload the repo root (this yaml lives in amlt/); see .amltignore
+
+storage:
+  data:
+    storage_account_name: vigstandard
+    container_name: data
+    mount_dir: /blob
+    is_output: true             # read checkpoints from + persist extracted drafts/reports back to the blob
+
+environment:
+  image: draft-opd/draft-opd:latest   # same image as training (sglang stack + libnuma). See amlt_draftopd.yaml note #1.
+  username: 44359f3e6e864ddba0853a221be97722
+  registry: 44359f3e6e864ddba0853a221be97722.azurecr.io
+  env:
+    AMLT_DOCKERFILE_TEMPLATE: none
+
+jobs:
+  - name: draftopd_eval
+    sku: ${NODES}x${MEM}G${GPUS}${NVLINK_SUFFIX}
+    sla_tier: ${SLA}
+    priority: high
+    mpi: False
+    process_count_per_node: 1
+    command:
+      - cd $$AMLT_CODE_DIR
+      # ---- HF env: override sglang_run_bench.sh's cluster-wrong defaults (it points
+      #      HF_HOME at a nonexistent local path and forces offline). Model + dataset
+      #      caches live on the blob under HF_HOME and are reused across runs. ----
+      - export AZURE_STORAGE_ROOT=$${AZURE_STORAGE_ROOT:-/blob/t-xinyangliu}
+      - export HF_HOME=$${HF_HOME:-$${AZURE_STORAGE_ROOT}/cache/hf}
+      - export HF_HUB_OFFLINE=0
+      - export HF_DATASETS_OFFLINE=0
+      # ---- Resolve the TRAINING run's checkpoint dir ----
+      - export TRAIN_EXP_NAME="${TRAIN_EXP_NAME}"
+      - 'test -n "$${TRAIN_EXP_NAME}" || { echo "[ERR] set TRAIN_EXP_NAME=<training experiment> when submitting"; exit 1; }'
+      - export CKPT_DIR="${CKPT_DIR_OVERRIDE}"
+      - export CKPT_DIR=$${CKPT_DIR:-$${AZURE_STORAGE_ROOT}/outputs/${TRAIN_JOB_NAME}/$${TRAIN_EXP_NAME}/checkpoints}
+      - 'test -d "$${CKPT_DIR}" || { echo "[ERR] checkpoint dir not found: $${CKPT_DIR}"; exit 1; }'
+      # ---- Wave width follows the requested SKU; DATASETS_CSV feeds both steps below ----
+      - export NUM_GPU=${GPUS}
+      - export DATASETS_CSV="${DATASETS_CSV}"
+      # ---- Step 1: download the eval datasets into the blob HF cache (idempotent; reused after) ----
+      - bash diffusion/dflash/prepare_eval_data.sh
+      # ---- Step 2: extract + sglang-bench every global_step_<N> (other bench knobs default in the script) ----
+      - bash diffusion/dflash/eval_checkpoints_sglang.sh
+    submit_args:
+      env:
+        DATASET_MOUNT_BLOCK_BASED_CACHE_ENABLED: True
+        SHARED_MEMORY_PERCENT: 0.5
