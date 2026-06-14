@@ -97,7 +97,7 @@ def test_build_opd_anchor_plan_default_mode_is_unchanged():
     assert int(segment_lens[block_keep_mask].max().item()) == 15
 
 
-def _make_response_stream_case(reject_indices):
+def _response_stream_case(reject_indices):
     # 1 prompt token + 3 response tokens; reject at the given response positions.
     data = TensorDict(
         {
@@ -117,7 +117,7 @@ def _make_response_stream_case(reject_indices):
     return data, model_output
 
 
-def _loss_cfg(corrected_token_forward_only):
+def _symmetric_k3_cfg():
     return SimpleNamespace(
         loss_mode="k3",
         loss_max_clamp=None,
@@ -127,31 +127,32 @@ def _loss_cfg(corrected_token_forward_only):
         forward_kl_weight=1.0,
         response_stream_weight=1.0,
         rejected_draft_stream_weight=1.0,
-        corrected_token_forward_only=corrected_token_forward_only,
     )
 
 
-def test_corrected_token_forward_only_zeros_reverse_at_reject_positions():
-    # reject at response position 1 -> token y_1 should be forward-KL only; positions 0,2 stay symmetric.
-    data, model_output = _make_response_stream_case(reject_indices=[1])
+def test_corrected_token_is_forward_only_by_default():
+    # By default (no flag), the corrected token at a reject position drops its reverse-KL term;
+    # agree positions stay symmetric. reject at response position 1.
+    data, model_output = _response_stream_case(reject_indices=[1])
     config = SimpleNamespace(loss_agg_mode="token-mean", global_batch_info={})
 
-    loss, _ = distillation_loss(config, SimpleNamespace(distillation_loss=_loss_cfg(True)), model_output, data)
+    loss, _ = distillation_loss(config, SimpleNamespace(distillation_loss=_symmetric_k3_cfg()), model_output, data)
 
     student = torch.tensor([-0.4, -0.9, -0.3])
     teacher = torch.tensor([-0.5, -0.7, -0.6])
     k3 = kl_penalty(student, teacher, "k3")
     bern = _bernoulli_forward_kl(student, teacher)
-    rev_mask = torch.tensor([1.0, 0.0, 1.0])  # reverse off at the corrected (reject) position
-    per_token = 0.5 * k3 * rev_mask + 1.0 * bern
+    reverse_on = torch.tensor([1.0, 0.0, 1.0])  # reverse dropped at the corrected (reject) position
+    per_token = 0.5 * k3 * reverse_on + 1.0 * bern
     assert torch.allclose(loss, per_token.mean())
 
 
-def test_corrected_token_forward_only_false_keeps_symmetric_everywhere():
-    data, model_output = _make_response_stream_case(reject_indices=[1])
+def test_no_reject_means_pure_symmetric_kl():
+    # No reject positions -> every response token keeps the full symmetric KL.
+    data, model_output = _response_stream_case(reject_indices=[])
     config = SimpleNamespace(loss_agg_mode="token-mean", global_batch_info={})
 
-    loss, _ = distillation_loss(config, SimpleNamespace(distillation_loss=_loss_cfg(False)), model_output, data)
+    loss, _ = distillation_loss(config, SimpleNamespace(distillation_loss=_symmetric_k3_cfg()), model_output, data)
 
     student = torch.tensor([-0.4, -0.9, -0.3])
     teacher = torch.tensor([-0.5, -0.7, -0.6])

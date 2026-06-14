@@ -54,10 +54,6 @@ distillation_loss:
   # Per-position decay for rejected draft tokens: offset 1 -> 1.0, offset 2 -> decay, offset 3 -> decay^2.
   rejected_draft_position_decay: 0.9
 
-  # Anchored Block-OPD per-position form: response tokens at reject positions (corrected token y) use
-  # forward-KL only; the reverse-KL at a reject position goes to the rejected token d instead.
-  corrected_token_forward_only: false
-
   # Optional max clamp value for distillation loss. If null, no clamping is applied.
   loss_max_clamp: null
 

@@ -55,11 +55,6 @@ class DistillationLossConfig(BaseConfig):
     rejected_draft_position_decay (float):
         Per-draft-offset decay for rejected draft token loss weights. The first drafted token uses weight 1.0,
         the second uses this value, the third uses this value squared, and so on.
-    corrected_token_forward_only (bool):
-        Anchored Block-OPD per-position form: when True, response tokens at SD reject positions (the
-        corrected token y) use forward-KL only (the reverse-KL "budget" at a reject position goes to the
-        rejected token d via the rejected-draft stream instead). Agree positions stay symmetric. Default
-        False keeps the existing behavior (symmetric KL on every response token).
     loss_max_clamp (float, optional):
         Maximum value to clamp distillation loss. If None, no clamping is applied.
     log_prob_min_clamp (float, optional):
@@ -93,7 +88,6 @@ class DistillationLossConfig(BaseConfig):
     rejected_draft_use_reverse_kl: bool = False
     rejected_draft_position_decay_enabled: bool = True
     rejected_draft_position_decay: float = 0.9
-    corrected_token_forward_only: bool = False
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 

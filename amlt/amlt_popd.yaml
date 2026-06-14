@@ -7,12 +7,10 @@ description: Anchored-Block parallel-OPD (Variant B, scalar free-anchor)
 # Override any knob at submit time, e.g.:
 #   ANCHOR_MODE=sampled ANCHOR_SAMPLE_RATIO=0.5 amlt run amlt/amlt_popd.yaml popd_sampled --yes
 #   REVERSE_KL_WEIGHT=0.5 amlt run amlt/amlt_popd.yaml popd_rev05 --yes
-#   CORRECTED_TOKEN_FORWARD_ONLY=False amlt run amlt/amlt_popd.yaml popd_symm --yes
 #
 # This runs verl/examples/.../run_qwen_gsm8k_anchored_block.sh, i.e. Anchored Block-OPD Variant B:
 #   - free stride-K anchors (verl_dflash_response_anchor_mode=stride_k), reject-independent;
-#   - agree tokens: symmetric KL (FORWARD_KL_WEIGHT forward + REVERSE_KL_WEIGHT reverse);
-#   - corrected token y at reject positions: forward-KL only (CORRECTED_TOKEN_FORWARD_ONLY=True);
+#   - response tokens: symmetric KL (FORWARD_KL_WEIGHT forward + REVERSE_KL_WEIGHT reverse);
 #   - rejected token d: reverse-KL, no position decay (REJECTED_DRAFT_POSITION_DECAY_ENABLED=False).
 #
 # Image / data / W&B setup is identical to amlt_draftopd.yaml — see that file's header notes #1-#3.
@@ -39,9 +37,8 @@ env_defaults:
   # ---- Anchored Block-OPD (Variant B) knobs ----
   ANCHOR_MODE: stride_k                 # stride_k | sampled
   ANCHOR_SAMPLE_RATIO: 1.0              # only used when ANCHOR_MODE=sampled
-  CORRECTED_TOKEN_FORWARD_ONLY: True    # corrected y -> forward-only; d -> reverse (per-position form)
   FORWARD_KL_WEIGHT: 1.0                # off-policy forward KL weight
-  REVERSE_KL_WEIGHT: 1.0                # on-policy reverse KL weight (symmetric on agree positions)
+  REVERSE_KL_WEIGHT: 1.0                # on-policy reverse KL weight (symmetric on response tokens)
   REJECTED_DRAFT_POSITION_DECAY_ENABLED: False   # no position decay on rejected token d for now
 
 target:
@@ -68,7 +65,7 @@ environment:
     AMLT_DOCKERFILE_TEMPLATE: none
 
 jobs:
-  - name: popd_anchored_block
+  - name: popd_train
     sku: ${NODES}x${MEM}G${GPUS}${NVLINK_SUFFIX}
     sla_tier: ${SLA}
     priority: high
@@ -100,7 +97,6 @@ jobs:
       # ---- Anchored Block-OPD (Variant B) knobs ----
       - export ANCHOR_MODE=${ANCHOR_MODE}
       - export ANCHOR_SAMPLE_RATIO=${ANCHOR_SAMPLE_RATIO}
-      - export CORRECTED_TOKEN_FORWARD_ONLY=${CORRECTED_TOKEN_FORWARD_ONLY}
       - export FORWARD_KL_WEIGHT=${FORWARD_KL_WEIGHT}
       - export REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT}
       - export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED}

@@ -462,8 +462,8 @@ def _combine_sampled_reverse_forward_losses(
     """Combine sampled reverse-KL and local Bernoulli forward-KL per token.
 
     ``reverse_token_mask`` (optional, same shape as the losses) gates the reverse-KL term per token:
-    where it is 0 the token keeps forward-KL only. Used by the Anchored Block-OPD per-position form to
-    make corrected (reject-position) tokens forward-only.
+    where it is 0 the token keeps forward-KL only. The response stream uses this to make corrected
+    (reject-position) tokens forward-only.
     """
     reverse_weight = _loss_weight(loss_config, "reverse_kl_weight", 1.0)
     forward_weight = _loss_weight(loss_config, "forward_kl_weight", 0.0)
@@ -862,8 +862,9 @@ def compute_eagle3_native_target_distribution_loss(
 def _build_corrected_token_mask(data: TensorDict, response_mask_bool: torch.Tensor) -> torch.Tensor:
     """Boolean ``(bsz, resp_len)`` marking response tokens at SD reject positions (the corrected token y).
 
-    Reads ``dflash_reject_token_indices`` (response-coordinate positions) from the batch; used by the
-    Anchored Block-OPD per-position form to make those tokens forward-KL only.
+    Reads ``dflash_reject_token_indices`` (response-coordinate positions) from the batch. The response
+    stream uses this to make corrected tokens forward-KL only (their reverse-KL is handled by the
+    rejected-draft stream on the rejected token d).
     """
     batch_size, resp_len = response_mask_bool.shape
     corrected = torch.zeros((batch_size, resp_len), dtype=torch.bool, device=response_mask_bool.device)
@@ -916,9 +917,12 @@ def compute_distillation_loss_reverse_kl_estimator(
     assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
 
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
+    # Per-position form (always on): response tokens at SD reject positions (corrected token y) use
+    # forward-KL only -- the reverse-KL at a reject position is handled by the rejected-draft stream on
+    # the rejected token d. Only meaningful when forward KL is active (otherwise there is nothing to
+    # fall back to), and a no-op when there is no reverse term or no reject metadata.
     reverse_token_mask = None
-    if getattr(loss_config, "corrected_token_forward_only", False):
-        # Anchored Block-OPD per-position form: corrected (reject-position) tokens are forward-KL only.
+    if _loss_weight(loss_config, "forward_kl_weight", 0.0) > 0:
         corrected = _build_corrected_token_mask(data, response_mask_bool)
         reverse_token_mask = (~corrected).to(student_log_probs.dtype)
     distillation_losses, component_metrics = _combine_sampled_reverse_forward_losses(
