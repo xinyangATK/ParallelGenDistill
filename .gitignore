@@ -26,10 +26,11 @@
 /install-local.sh
 /.nested-git-backups/
 
-# In the OPD trainer examples, publish only the two reusable entrypoints.
+# In the OPD trainer examples, publish only the reusable entrypoints.
 /verl/examples/on_policy_distillation_trainer/*
 !/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k.sh
 !/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh
+!/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_anchored_block.sh
 
 # Local experiment notes and one-off conversion wrappers contain machine paths.
 /verl/change-by-codex.md

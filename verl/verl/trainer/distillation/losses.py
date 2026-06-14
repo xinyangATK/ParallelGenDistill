@@ -457,7 +457,14 @@ def _combine_sampled_reverse_forward_losses(
     mask: torch.Tensor,
     stream_name: str,
     force_reverse_kl: bool = False,
+    reverse_token_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Metric]]:
+    """Combine sampled reverse-KL and local Bernoulli forward-KL per token.
+
+    ``reverse_token_mask`` (optional, same shape as the losses) gates the reverse-KL term per token:
+    where it is 0 the token keeps forward-KL only. Used by the Anchored Block-OPD per-position form to
+    make corrected (reject-position) tokens forward-only.
+    """
     reverse_weight = _loss_weight(loss_config, "reverse_kl_weight", 1.0)
     forward_weight = _loss_weight(loss_config, "forward_kl_weight", 0.0)
     metric_prefix = "distillation/" if stream_name == "response" else f"distillation/{stream_name}_"
@@ -473,7 +480,7 @@ def _combine_sampled_reverse_forward_losses(
         }
     if reverse_weight == 0 and forward_weight == 0:
         raise ValueError("At least one of reverse_kl_weight or forward_kl_weight must be positive.")
-    if forward_weight == 0 and reverse_weight == 1.0:
+    if forward_weight == 0 and reverse_weight == 1.0 and reverse_token_mask is None:
         return (
             kl_penalty(
                 logprob=student_log_probs,
@@ -493,7 +500,10 @@ def _combine_sampled_reverse_forward_losses(
             ref_logprob=teacher_log_probs,
             kl_penalty=sampled_loss_mode,
         )
-        total_losses = reverse_losses * reverse_weight
+        gated_reverse_losses = (
+            reverse_losses if reverse_token_mask is None else reverse_losses * reverse_token_mask.to(reverse_losses.dtype)
+        )
+        total_losses = gated_reverse_losses * reverse_weight
     if forward_weight > 0:
         forward_losses = _local_bernoulli_forward_kl(
             student_log_probs=student_log_probs,
@@ -849,6 +859,38 @@ def compute_eagle3_native_target_distribution_loss(
     return native_ce_losses, metrics
 
 
+def _build_corrected_token_mask(data: TensorDict, response_mask_bool: torch.Tensor) -> torch.Tensor:
+    """Boolean ``(bsz, resp_len)`` marking response tokens at SD reject positions (the corrected token y).
+
+    Reads ``dflash_reject_token_indices`` (response-coordinate positions) from the batch; used by the
+    Anchored Block-OPD per-position form to make those tokens forward-KL only.
+    """
+    batch_size, resp_len = response_mask_bool.shape
+    corrected = torch.zeros((batch_size, resp_len), dtype=torch.bool, device=response_mask_bool.device)
+    raw = tu.get_non_tensor_data(data=data, key="dflash_reject_token_indices", default=None)
+    if raw is None:
+        return corrected
+    raw = tu.unwrap_non_tensor_data(raw)
+    if hasattr(raw, "tolist"):
+        raw = raw.tolist()
+    if batch_size == 1 and (
+        not isinstance(raw, (list, tuple)) or (raw and all(not isinstance(x, (list, tuple)) for x in raw))
+    ):
+        raw = [raw]
+    for batch_idx, sample_indices in enumerate(raw):
+        if batch_idx >= batch_size or sample_indices is None:
+            continue
+        if hasattr(sample_indices, "tolist"):
+            sample_indices = sample_indices.tolist()
+        if not isinstance(sample_indices, (list, tuple)):
+            sample_indices = [sample_indices]
+        for reject_idx in sample_indices:
+            reject_idx = int(reject_idx)
+            if 0 <= reject_idx < resp_len:
+                corrected[batch_idx, reject_idx] = True
+    return corrected
+
+
 @register_distillation_loss(
     DistillationLossSettings(names=["kl", "k1", "abs", "mse", "k2", "low_var_kl", "k3"], use_estimator=True)
 )  # type: ignore[arg-type]
@@ -874,12 +916,18 @@ def compute_distillation_loss_reverse_kl_estimator(
     assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
 
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
+    reverse_token_mask = None
+    if getattr(loss_config, "corrected_token_forward_only", False):
+        # Anchored Block-OPD per-position form: corrected (reject-position) tokens are forward-KL only.
+        corrected = _build_corrected_token_mask(data, response_mask_bool)
+        reverse_token_mask = (~corrected).to(student_log_probs.dtype)
     distillation_losses, component_metrics = _combine_sampled_reverse_forward_losses(
         student_log_probs=student_log_probs,
         teacher_log_probs=teacher_log_probs,
         loss_config=loss_config,
         mask=response_mask_bool,
         stream_name="response",
+        reverse_token_mask=reverse_token_mask,
     )
     # Since k1 can be negative, log the mean absolute loss.
     if response_mask_bool.any():

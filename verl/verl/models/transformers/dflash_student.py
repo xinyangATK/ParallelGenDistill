@@ -338,6 +338,29 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             value = os.getenv("VERL_DFLASH_RANDOM_RESPONSE_ANCHOR_SEED", "42")
         return int(value)
 
+    def _get_response_anchor_mode(self) -> str:
+        """Anchored Block-OPD anchor selection: 'reject' (default, SD-reject-driven) or a free mode
+        ('stride_k' | 'sampled') that covers the response independently of reject positions."""
+        value = getattr(self.config, "verl_dflash_response_anchor_mode", None)
+        if value is None:
+            value = os.getenv("VERL_DFLASH_RESPONSE_ANCHOR_MODE", "reject")
+        return str(value)
+
+    def _get_response_anchor_sample_ratio(self) -> float:
+        value = getattr(self.config, "verl_dflash_response_anchor_sample_ratio", None)
+        if value is None:
+            value = os.getenv("VERL_DFLASH_RESPONSE_ANCHOR_SAMPLE_RATIO", "1.0")
+        value = float(value)
+        if not 0.0 < value <= 1.0:
+            raise ValueError(f"verl_dflash_response_anchor_sample_ratio must be in (0, 1], got {value}.")
+        return value
+
+    def _get_response_anchor_seed(self) -> int:
+        value = getattr(self.config, "verl_dflash_response_anchor_seed", None)
+        if value is None:
+            value = os.getenv("VERL_DFLASH_RESPONSE_ANCHOR_SEED", "42")
+        return int(value)
+
     def _get_rejected_draft_max_tokens_per_sample(self) -> Optional[int]:
         value = getattr(self.config, "verl_dflash_rejected_draft_max_tokens_per_sample", None)
         if value is None:
@@ -481,6 +504,45 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             cursor += segment_len + gaps[segment_idx + 1]
         return anchors_resp, segment_lens
 
+    @staticmethod
+    def _build_free_response_anchors(
+        *,
+        response_len: int,
+        num_predict: int,
+        mode: str,
+        sample_ratio: float,
+        seed: int,
+    ) -> tuple[list[int], list[int]]:
+        """Enumerate free (reject-independent) ``(anchor_resp, segment_len)`` for Anchored Block-OPD.
+
+        Anchors are in response coordinates (``-1`` is the last prompt token). Anchor ``a`` distills
+        the next ``segment_len`` response tokens (positions ``a+1 .. a+segment_len``); ``segment_len``
+        is capped at ``num_predict`` (= draft block heads) and clamped to the response end. Modes:
+          - ``stride_k``: non-overlapping blocks covering the response (anchors at -1, -1+K, ...).
+          - ``sampled``: keep each candidate position with prob ``sample_ratio`` (always keep -1).
+        """
+        if response_len <= 0 or num_predict <= 0:
+            return [], []
+        last = response_len - 1  # last response position usable as a prediction target
+        if mode == "sampled":
+            rng = random.Random(int(seed))
+            candidates = [a for a in range(-1, last) if rng.random() < sample_ratio]
+            if -1 not in candidates:
+                candidates.insert(0, -1)
+        elif mode == "stride_k":
+            candidates = list(range(-1, last, num_predict))
+        else:
+            raise ValueError(f"Unknown response anchor mode {mode!r}; expected reject, stride_k, or sampled.")
+        anchors: list[int] = []
+        segments: list[int] = []
+        for anchor_resp in candidates:
+            segment_len = min(num_predict, last - anchor_resp)
+            if segment_len <= 0:
+                continue
+            anchors.append(anchor_resp)
+            segments.append(segment_len)
+        return anchors, segments
+
     def _build_opd_anchor_plan(
         self,
         *,
@@ -493,6 +555,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         response_anchor_stride: int = 1,
         random_response_anchor_enabled: bool = False,
         random_response_anchor_seed: int = 42,
+        anchor_mode: str = "reject",
+        anchor_sample_ratio: float = 1.0,
+        anchor_seed: int = 42,
         rejected_draft_anchor_indices: Optional[torch.LongTensor] = None,
         rejected_draft_offsets: Optional[torch.LongTensor] = None,
         rejected_draft_mask: Optional[torch.Tensor] = None,
@@ -512,65 +577,77 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         for batch_idx in range(batch_size):
             prompt_len = int(prompt_lengths[batch_idx].item())
             response_len = int(response_lengths[batch_idx].item())
-            if response_len <= 0:
-                anchors_resp: list[int] = []
-                boundaries_resp: list[int] = []
-            else:
-                raw_rejects = reject_token_indices[batch_idx]
-                rejects = sorted(
-                    {
-                        int(idx.item())
-                        for idx in raw_rejects
-                        if int(idx.item()) >= 0 and int(idx.item()) < response_len
-                    }
-                )
-                total_reject_count += len(rejects)
-                if len(rejects) == 0:
-                    empty_reject_sample_count += 1
-                    anchors_resp = []
-                    boundaries_resp = []
-                elif rejects[-1] < response_len - 1:
-                    rejects.append(response_len - 1)
-                    anchors_resp = [-1] + rejects
-                    boundaries_resp = rejects
-                else:
-                    anchors_resp = [-1] + rejects
-                    boundaries_resp = rejects
-
-            if response_anchor_stride > 1 and anchors_resp:
-                anchor_boundary_pairs = list(zip(anchors_resp, boundaries_resp, strict=False))
-                anchor_boundary_pairs = [
-                    pair
-                    for pair_idx, pair in enumerate(anchor_boundary_pairs)
-                    if pair_idx % response_anchor_stride == 0 or pair_idx == len(anchor_boundary_pairs) - 1
-                ]
-                anchors_resp = [pair[0] for pair in anchor_boundary_pairs]
-                boundaries_resp = [pair[1] for pair in anchor_boundary_pairs]
             sample_anchors: list[int] = []
             sample_segment_lens: list[int] = []
             sample_row_starts: list[int] = []
             response_anchors_resp: list[int] = []
             response_segment_lens: list[int] = []
-            for anchor_resp, boundary_resp in zip(anchors_resp, boundaries_resp, strict=False):
-                full_anchor = prompt_len - 1 if anchor_resp < 0 else prompt_len + anchor_resp
-                segment_len = boundary_resp - anchor_resp
-                if segment_len <= 0:
-                    continue
-                segment_len = min(segment_len, draft_block_size - 1)
-                if full_anchor < 0 or full_anchor >= seq_len - 1:
-                    continue
-                response_anchors_resp.append(anchor_resp)
-                response_segment_lens.append(segment_len)
 
-            if random_response_anchor_enabled and response_len > 0 and response_segment_lens:
-                response_anchors_resp, response_segment_lens = self._build_random_response_anchor_plan(
-                    input_ids=input_ids,
-                    batch_idx=batch_idx,
-                    prompt_len=prompt_len,
+            if anchor_mode != "reject":
+                # Free anchors cover the response independently of SD reject positions; the rest of the
+                # plan (sequence-coord conversion + optional rejected-draft anchors) is shared.
+                response_anchors_resp, response_segment_lens = self._build_free_response_anchors(
                     response_len=response_len,
-                    segment_lens=response_segment_lens,
-                    seed=random_response_anchor_seed,
+                    num_predict=draft_block_size - 1,
+                    mode=anchor_mode,
+                    sample_ratio=anchor_sample_ratio,
+                    seed=anchor_seed + batch_idx,
                 )
+            else:
+                if response_len <= 0:
+                    anchors_resp: list[int] = []
+                    boundaries_resp: list[int] = []
+                else:
+                    raw_rejects = reject_token_indices[batch_idx]
+                    rejects = sorted(
+                        {
+                            int(idx.item())
+                            for idx in raw_rejects
+                            if int(idx.item()) >= 0 and int(idx.item()) < response_len
+                        }
+                    )
+                    total_reject_count += len(rejects)
+                    if len(rejects) == 0:
+                        empty_reject_sample_count += 1
+                        anchors_resp = []
+                        boundaries_resp = []
+                    elif rejects[-1] < response_len - 1:
+                        rejects.append(response_len - 1)
+                        anchors_resp = [-1] + rejects
+                        boundaries_resp = rejects
+                    else:
+                        anchors_resp = [-1] + rejects
+                        boundaries_resp = rejects
+
+                if response_anchor_stride > 1 and anchors_resp:
+                    anchor_boundary_pairs = list(zip(anchors_resp, boundaries_resp, strict=False))
+                    anchor_boundary_pairs = [
+                        pair
+                        for pair_idx, pair in enumerate(anchor_boundary_pairs)
+                        if pair_idx % response_anchor_stride == 0 or pair_idx == len(anchor_boundary_pairs) - 1
+                    ]
+                    anchors_resp = [pair[0] for pair in anchor_boundary_pairs]
+                    boundaries_resp = [pair[1] for pair in anchor_boundary_pairs]
+                for anchor_resp, boundary_resp in zip(anchors_resp, boundaries_resp, strict=False):
+                    full_anchor = prompt_len - 1 if anchor_resp < 0 else prompt_len + anchor_resp
+                    segment_len = boundary_resp - anchor_resp
+                    if segment_len <= 0:
+                        continue
+                    segment_len = min(segment_len, draft_block_size - 1)
+                    if full_anchor < 0 or full_anchor >= seq_len - 1:
+                        continue
+                    response_anchors_resp.append(anchor_resp)
+                    response_segment_lens.append(segment_len)
+
+                if random_response_anchor_enabled and response_len > 0 and response_segment_lens:
+                    response_anchors_resp, response_segment_lens = self._build_random_response_anchor_plan(
+                        input_ids=input_ids,
+                        batch_idx=batch_idx,
+                        prompt_len=prompt_len,
+                        response_len=response_len,
+                        segment_lens=response_segment_lens,
+                        seed=random_response_anchor_seed,
+                    )
 
             for anchor_resp, segment_len in zip(response_anchors_resp, response_segment_lens, strict=False):
                 full_anchor = prompt_len - 1 if anchor_resp < 0 else prompt_len + anchor_resp
@@ -978,6 +1055,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         response_anchor_stride = self._get_response_anchor_stride()
         random_response_anchor_enabled = self._get_random_response_anchor_enabled()
         random_response_anchor_seed = self._get_random_response_anchor_seed()
+        response_anchor_mode = self._get_response_anchor_mode()
+        response_anchor_sample_ratio = self._get_response_anchor_sample_ratio()
+        response_anchor_seed = self._get_response_anchor_seed()
         rejected_draft_max_tokens_per_sample = self._get_rejected_draft_max_tokens_per_sample()
         split_random_rejected_pass = random_response_anchor_enabled
         anchor_positions, segment_lens, row_starts, block_keep_mask, valid_seq_lens, opd_metrics = (
@@ -991,6 +1071,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 response_anchor_stride=response_anchor_stride,
                 random_response_anchor_enabled=random_response_anchor_enabled,
                 random_response_anchor_seed=random_response_anchor_seed,
+                anchor_mode=response_anchor_mode,
+                anchor_sample_ratio=response_anchor_sample_ratio,
+                anchor_seed=response_anchor_seed,
                 rejected_draft_anchor_indices=rejected_draft_anchor_indices,
                 rejected_draft_offsets=rejected_draft_offsets,
                 rejected_draft_mask=rejected_draft_mask,
