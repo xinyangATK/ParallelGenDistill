@@ -721,7 +721,14 @@ def distillation_loss(
             if global_response_count is None:
                 global_response_count = response_count
             global_rejected_count = global_batch_info.get("opd_rejected_draft_batch_num_tokens")
-            if global_rejected_count is None:
+            if loss_config.onpolicy_reverse_enabled:
+                # Anchored Block-OPD Plan A draws one fresh on-policy sample per response-prediction
+                # position, so the reverse stream is co-located with the response stream and
+                # N_rejected == N_response. The engine's opd_rejected_draft_batch_num_tokens counts the
+                # (ignored) rollout rejects, so mirror the response global count instead -- the two
+                # streams then share one normalization basis, like the single-stream draftopd loss.
+                global_rejected_count = global_response_count
+            elif global_rejected_count is None:
                 global_rejected_count = rejected_count
             global_rejected_effective_count = global_batch_info.get(
                 "opd_rejected_draft_batch_effective_num_tokens"

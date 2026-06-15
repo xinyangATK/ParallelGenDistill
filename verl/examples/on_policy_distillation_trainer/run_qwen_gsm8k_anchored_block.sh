@@ -8,6 +8,9 @@
 #
 # Mapping to the Anchored Block-OPD doc (scalar form):
 #   response tokens (free anchors) -> symmetric KL (FORWARD_KL_WEIGHT forward + REVERSE_KL_WEIGHT reverse)
+#     exception: a response token at an SD reject position (the corrected token y) is forward-KL ONLY --
+#       its reverse KL is NOT computed on y; that reverse term is handled by the rejected-draft stream on
+#       the rejected token d (avoids double-counting). This gating is active whenever FORWARD_KL_WEIGHT > 0.
 #   rejected draft token d          -> reverse KL  (KL(q || P_d))   [rejected-draft stream; no position decay]
 #
 # Anchor knobs:

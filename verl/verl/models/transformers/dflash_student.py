@@ -361,6 +361,33 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             value = os.getenv("VERL_DFLASH_RESPONSE_ANCHOR_SEED", "42")
         return int(value)
 
+    def _get_onpolicy_reverse_enabled(self) -> bool:
+        """Anchored Block-OPD Plan A: enable the on-policy reverse stream on fresh draft samples instead
+        of the rollout-reject driven rejected-draft stream."""
+        value = getattr(self.config, "verl_dflash_onpolicy_reverse_enabled", None)
+        if value is None:
+            value = os.getenv("VERL_DFLASH_ONPOLICY_REVERSE_ENABLED", "0")
+        return str(value).lower() in {"1", "true", "yes", "on"}
+
+    def _get_draft_sample_temperature(self) -> float:
+        """T_draft for drawing fresh on-policy samples y_hat_j ~ q. 1.0 gives genuine q-samples (an
+        unbiased k3 reverse-KL estimate); other values trade bias for exploration."""
+        value = getattr(self.config, "verl_dflash_draft_sample_temperature", None)
+        if value is None:
+            value = os.getenv("VERL_DFLASH_DRAFT_SAMPLE_TEMPERATURE", "1.0")
+        value = float(value)
+        if value <= 0.0:
+            raise ValueError(f"verl_dflash_draft_sample_temperature must be positive, got {value}.")
+        return value
+
+    def _get_draft_sample_seed(self) -> int:
+        """Seed for the Plan A draft sampler. A negative value uses the global RNG (genuinely fresh
+        samples that advance with training); a non-negative value makes sampling reproducible per call."""
+        value = getattr(self.config, "verl_dflash_draft_sample_seed", None)
+        if value is None:
+            value = os.getenv("VERL_DFLASH_DRAFT_SAMPLE_SEED", "-1")
+        return int(value)
+
     def _get_rejected_draft_max_tokens_per_sample(self) -> Optional[int]:
         value = getattr(self.config, "verl_dflash_rejected_draft_max_tokens_per_sample", None)
         if value is None:
@@ -461,6 +488,62 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         selected_log_probs = torch.cat(log_prob_chunks, dim=0)
         selected_entropy = torch.cat(entropy_chunks, dim=0) if calculate_entropy else None
         return selected_log_probs, selected_entropy
+
+    def _sample_and_score_onpolicy_reverse(
+        self,
+        *,
+        draft_hidden: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        output_embeddings: torch.nn.Module,
+        batch_indices: torch.LongTensor,
+        draft_indices: torch.LongTensor,
+        row_indices: torch.LongTensor,
+        chunk_size: int,
+        sample_temperature: float,
+        generator: Optional[torch.Generator] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Anchored Block-OPD Plan A: draw a fresh on-policy draft sample and score it.
+
+        At each selected position ``(batch_indices, draft_indices)`` it samples ``y_hat ~ q_phi^(j)`` from
+        the draft head at ``sample_temperature`` and returns:
+          - ``log q(y_hat)`` from the same draft head at temperature 1 (with gradient) -- the student term;
+          - ``log p(y_hat)`` from the frozen teacher logits at ``row_indices`` (no gradient) -- the teacher
+            term, i.e. the realized-prefix distribution p(.|s_t, y_<j) gathered at ``y_hat``;
+          - the sampled token ids ``y_hat``.
+        ``log q`` uses temperature 1 so the downstream k3 reverse-KL is an unbiased estimate of
+        KL(q||p) when ``sample_temperature == 1``.
+        """
+        if batch_indices.numel() == 0:
+            empty = draft_hidden.new_empty((0,), dtype=torch.float32)
+            empty_ids = batch_indices.new_empty((0,), dtype=torch.long)
+            return empty, empty, empty_ids
+
+        selected_hidden = draft_hidden[batch_indices, draft_indices, :]
+        log_q_chunks: list[torch.Tensor] = []
+        log_p_chunks: list[torch.Tensor] = []
+        sample_chunks: list[torch.Tensor] = []
+        for start in range(0, selected_hidden.shape[0], chunk_size):
+            end = min(start + chunk_size, selected_hidden.shape[0])
+            draft_logits = output_embeddings(selected_hidden[start:end]).float()
+            draft_log_probs = F.log_softmax(draft_logits, dim=-1)
+            with torch.no_grad():
+                sample_probs = F.softmax(draft_logits.detach() / sample_temperature, dim=-1)
+                sampled = torch.multinomial(sample_probs, num_samples=1, generator=generator).squeeze(-1)
+                teacher_chunk_logits = teacher_logits[
+                    batch_indices[start:end], row_indices[start:end], :
+                ].float()
+                teacher_log_probs = F.log_softmax(teacher_chunk_logits, dim=-1)
+                log_p = teacher_log_probs.gather(dim=-1, index=sampled.unsqueeze(-1)).squeeze(-1)
+            log_q = draft_log_probs.gather(dim=-1, index=sampled.unsqueeze(-1)).squeeze(-1)
+            log_q_chunks.append(log_q)
+            log_p_chunks.append(log_p)
+            sample_chunks.append(sampled)
+
+        return (
+            torch.cat(log_q_chunks, dim=0),
+            torch.cat(log_p_chunks, dim=0),
+            torch.cat(sample_chunks, dim=0),
+        )
 
     def _build_random_response_anchor_plan(
         self,
@@ -1020,6 +1103,11 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         draft_forward_ms = 0.0
         lm_head_ms = 0.0
 
+        # Anchored Block-OPD Plan A: replace the rollout-reject reverse stream with a fresh on-policy
+        # draft sample drawn at each response-prediction position. Read the flag early so the teacher
+        # forward can retain its full-vocab logits (needed to score log p(y_hat_j)).
+        onpolicy_reverse_enabled = self._get_onpolicy_reverse_enabled()
+
         target_kwargs = dict(kwargs)
         target_kwargs.pop("dflash_prompt_lengths", None)
         target_kwargs.pop("dflash_response_lengths", None)
@@ -1045,8 +1133,16 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             if teacher_outputs.hidden_states is None:
                 raise RuntimeError("Teacher model did not return hidden states required by DFLASH draft.")
             target_hidden = self._extract_target_hidden(teacher_outputs.hidden_states)
+            # Plan A scores the fresh draft sample against the frozen teacher's realized-prefix
+            # distribution p(.|s_t, y_<j); these logits are already computed by the main_model forward.
+            teacher_logits = teacher_outputs.logits if onpolicy_reverse_enabled else None
         self._maybe_sync_for_profile(profile_enabled, input_ids.device)
         teacher_forward_ms = (time.perf_counter() - teacher_start_time) * 1000.0
+        if onpolicy_reverse_enabled and teacher_logits is None:
+            raise RuntimeError(
+                "Plan A on-policy reverse requires full-vocab teacher logits from the frozen main model, "
+                "but main_model did not return logits."
+            )
 
         # SGLang DFLASH uses block_size as the total block length: one anchor
         # token plus block_size - 1 future-token predictions.
@@ -1059,6 +1155,13 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         response_anchor_sample_ratio = self._get_response_anchor_sample_ratio()
         response_anchor_seed = self._get_response_anchor_seed()
         rejected_draft_max_tokens_per_sample = self._get_rejected_draft_max_tokens_per_sample()
+        draft_sample_temperature = self._get_draft_sample_temperature()
+        draft_sample_seed = self._get_draft_sample_seed()
+        if onpolicy_reverse_enabled and random_response_anchor_enabled:
+            raise NotImplementedError(
+                "Plan A on-policy reverse (verl_dflash_onpolicy_reverse_enabled) is not supported together "
+                "with verl_dflash_random_response_anchor_enabled."
+            )
         split_random_rejected_pass = random_response_anchor_enabled
         anchor_positions, segment_lens, row_starts, block_keep_mask, valid_seq_lens, opd_metrics = (
             self._build_opd_anchor_plan(
@@ -1143,6 +1246,13 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         rejected_student_log_probs = target_hidden.new_zeros((batch_size, rejected_width), dtype=torch.float32)
         rejected_teacher_log_probs = target_hidden.new_zeros((batch_size, rejected_width), dtype=torch.float32)
         rejected_loss_mask = torch.zeros((batch_size, rejected_width), dtype=torch.bool, device=input_ids.device)
+        # Plan A reverse stream lives in sequence coordinates (mirrors log_probs_by_seq), one fresh draft
+        # sample per response-prediction position, so N_rejected == N_response by construction.
+        onpolicy_log_q_by_seq = onpolicy_log_p_by_seq = onpolicy_mask_by_seq = None
+        if onpolicy_reverse_enabled:
+            onpolicy_log_q_by_seq = target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32)
+            onpolicy_log_p_by_seq = target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32)
+            onpolicy_mask_by_seq = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=input_ids.device)
         response_lm_token_count = 0
         attn_impl = str(getattr(getattr(self.draft_model, "config", None), "_attn_implementation", "eager"))
         ran_draft_forward = False
@@ -1206,7 +1316,37 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     entropy_by_seq[response_batch_tensor, response_row_tensor] = selected_entropy
                 response_lm_token_count = response_batch_tensor.numel()
 
-            if not split_random_rejected_pass:
+                if onpolicy_reverse_enabled:
+                    # Plan A: at the same positions, draw a fresh draft sample y_hat_j ~ q_phi^(j) and pair
+                    # log q(y_hat_j) [grad] with the teacher's log p(y_hat_j) [no grad]. Overlapping blocks
+                    # (sampled mode) collide on the same seq position; the scatter dedups exactly as the
+                    # response stream does, keeping N_rejected == N_response.
+                    sample_generator = None
+                    if draft_sample_seed >= 0:
+                        sample_generator = torch.Generator(device=draft_hidden.device).manual_seed(
+                            int(draft_sample_seed)
+                        )
+                    onpolicy_log_q, onpolicy_log_p, _ = self._sample_and_score_onpolicy_reverse(
+                        draft_hidden=draft_hidden,
+                        teacher_logits=teacher_logits,
+                        output_embeddings=output_embeddings,
+                        batch_indices=response_batch_tensor,
+                        draft_indices=response_draft_tensor,
+                        row_indices=response_row_tensor,
+                        chunk_size=lm_head_chunk_size,
+                        sample_temperature=draft_sample_temperature,
+                        generator=sample_generator,
+                    )
+                    onpolicy_log_q_by_seq[response_batch_tensor, response_row_tensor] = onpolicy_log_q
+                    onpolicy_log_p_by_seq[response_batch_tensor, response_row_tensor] = onpolicy_log_p
+                    onpolicy_mask_by_seq[response_batch_tensor, response_row_tensor] = True
+
+            if onpolicy_reverse_enabled:
+                # Plan A feeds the fresh-sample reverse stream through the existing rejected-draft channel.
+                rejected_student_log_probs = onpolicy_log_q_by_seq
+                rejected_teacher_log_probs = onpolicy_log_p_by_seq
+                rejected_loss_mask = onpolicy_mask_by_seq
+            elif not split_random_rejected_pass:
                 rejected_student_log_probs, rejected_teacher_log_probs, rejected_loss_mask = (
                     self._collect_rejected_draft_log_probs(
                         draft_hidden=draft_hidden,
@@ -1270,6 +1410,10 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         lm_head_ms = (time.perf_counter() - lm_head_start_time) * 1000.0
         rejected_lm_token_count = rejected_loss_mask.sum()
         selected_lm_token_count = loss_mask_by_seq.sum() + rejected_lm_token_count
+        if onpolicy_reverse_enabled:
+            # Plan A reverse stream is sequence-shaped; drop the (batch, rejected_width) rollout offsets so
+            # the output offsets fall back to zeros matching the sequence-shaped mask (position decay is off).
+            rejected_draft_offsets = None
 
         # Return a plain container so FSDP can discover tensors and attach
         # pre-backward hooks. A custom object can leave FSDP in IDLE at backward.
