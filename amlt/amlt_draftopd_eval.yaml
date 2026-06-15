@@ -41,6 +41,10 @@ env_defaults:
   # ---- Datasets (shared by the data-prep step and the eval) ----
   DATASETS_CSV: "gsm8k:128,math500:128"
 
+  # ---- Ablation
+  REJECTED_DRAFT_POSITION_DECAY_ENABLED: True   # no position decay on rejected token d for now
+
+
 target:
   service: sing
   name: GenAI-Shared-UKSouth2
@@ -89,6 +93,7 @@ jobs:
       # ---- Wave width follows the requested SKU; DATASETS_CSV feeds both steps below ----
       - export NUM_GPU=${GPUS}
       - export DATASETS_CSV="${DATASETS_CSV}"
+      - export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED}
       # ---- Step 1: download the eval datasets into the blob HF cache (idempotent; reused after) ----
       - bash diffusion/dflash/prepare_eval_data.sh
       # ---- Step 2: extract + sglang-bench every global_step_<N> (other bench knobs default in the script) ----
