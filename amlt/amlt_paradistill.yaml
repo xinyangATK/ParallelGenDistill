@@ -37,7 +37,7 @@ env_defaults:
   # ---- Paradistill knobs ----
   ANCHOR_MODE: sampled                 # stride_k | sampled
   ANCHOR_SAMPLE_RATIO: 0.2              # only used when ANCHOR_MODE=sampled
-  DRAFT_SAMPLE_TEMPERATURE: 0.         # T_draft for the fresh on-policy draft samples (1.0 = genuine q-samples)
+  DRAFT_SAMPLE_TEMPERATURE: 1.0         # T_draft for the fresh on-policy draft samples (1.0 = genuine q-samples)
   REJECTED_DRAFT_POSITION_DECAY_ENABLED: True   # True -> weight each fresh sample by decay^(offset-1)
   REJECTED_DRAFT_POSITION_DECAY: 1.0             # per-offset decay factor (only used when the above is True)
 
