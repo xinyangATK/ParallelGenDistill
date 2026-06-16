@@ -1266,7 +1266,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         # by sequence position. Overlapping blocks (sampled-mode anchors) each re-sample their own fresh
         # draft token from a different head/context, so every slot is a distinct on-policy sample and must
         # contribute its own reverse loss -- no per-position dedup. N_rejected = total slots (>= N_response).
-        onpolicy_flat_log_q = onpolicy_flat_log_p = None
+        onpolicy_flat_log_q = onpolicy_flat_log_p = onpolicy_flat_offsets = None
         response_lm_token_count = 0
         attn_impl = str(getattr(getattr(self.draft_model, "config", None), "_attn_implementation", "eager"))
         ran_draft_forward = False
@@ -1340,6 +1340,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                             generator=sample_generator,
                         )
                     )
+                    # Each slot's draft index packs anchor_block * block_size + offset, so the offset (the
+                    # draft head index, 1..K) recovers from a modulo -- used for optional per-offset decay.
+                    onpolicy_flat_offsets = response_draft_tensor % draft_block_size
                 else:
                     selected_log_probs, selected_entropy = self._compute_selected_lm_log_probs(
                         draft_hidden=draft_hidden,
@@ -1358,7 +1361,8 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
 
             if onpolicy_reverse_enabled:
                 # paradistill feeds the flat fresh-sample reverse stream through the rejected-draft channel as
-                # (1, M): the loss only needs total counts + elementwise terms, not per-sample rows. When
+                # (1, M): the loss only needs total counts + elementwise terms, not per-sample rows. The
+                # per-slot offsets (1..K) carry through so the loss can optionally decay by offset. When
                 # there are no slots the zero-initialized buffers already give an all-False mask (the loss
                 # then skips the reverse stream), so only the populated case needs handling.
                 if onpolicy_flat_log_q is not None and onpolicy_flat_log_q.numel() > 0:
@@ -1367,6 +1371,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     rejected_loss_mask = torch.ones(
                         (1, onpolicy_flat_log_q.shape[0]), dtype=torch.bool, device=input_ids.device
                     )
+                    rejected_draft_offsets = onpolicy_flat_offsets.unsqueeze(0).to(torch.long)
             elif not split_random_rejected_pass:
                 rejected_student_log_probs, rejected_teacher_log_probs, rejected_loss_mask = (
                     self._collect_rejected_draft_log_probs(
@@ -1431,10 +1436,6 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         lm_head_ms = (time.perf_counter() - lm_head_start_time) * 1000.0
         rejected_lm_token_count = rejected_loss_mask.sum()
         selected_lm_token_count = loss_mask_by_seq.sum() + rejected_lm_token_count
-        if onpolicy_reverse_enabled:
-            # paradistill reverse stream is flat (1, M); drop the (batch, rejected_width) rollout offsets so the
-            # output offsets fall back to zeros matching the flat mask (position decay is off anyway).
-            rejected_draft_offsets = None
 
         # Return a plain container so FSDP can discover tensors and attach
         # pre-backward hooks. A custom object can leave FSDP in IDLE at backward.

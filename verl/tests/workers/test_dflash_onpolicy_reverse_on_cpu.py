@@ -185,6 +185,70 @@ def test_paradistill_loss_uses_flat_slot_count_with_overlap_and_ignores_polluted
     assert torch.allclose(loss, expected, atol=1e-6)
 
 
+def test_paradistill_loss_applies_offset_decay_and_normalizes_by_decay_weight():
+    # paradistill with position decay ON: each reverse slot is weighted decay^(offset-1) in BOTH the
+    # numerator and the denominator (sum of weights). The engine's (rollout-based) counts are ignored.
+    data = TensorDict(
+        {
+            "prompts": torch.tensor([[1]]),
+            "responses": torch.tensor([[2, 3, 4]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1]]),
+            "response_mask": torch.tensor([[1, 1, 1]]),
+            "teacher_logprobs": _nested_logprobs([-0.5, -0.7, -0.6, 0.0]),
+        },
+        batch_size=[1],
+    )
+    logq_y = torch.tensor([-0.4, -0.9, -0.3, 0.0])
+    mask = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    logq_yhat = torch.tensor([[-1.1, -0.2, -0.9]])
+    logp_yhat = torch.tensor([[-0.6, -0.5, -0.4]])
+    offsets = torch.tensor([[1, 2, 3]])  # per-slot draft offset (1..K)
+    model_output = {
+        "log_probs": logq_y,
+        "opd_loss_mask": mask,
+        "opd_rejected_draft_student_log_probs": logq_yhat,
+        "opd_rejected_draft_teacher_log_probs": logp_yhat,
+        "opd_rejected_draft_loss_mask": torch.ones_like(logq_yhat, dtype=torch.bool),
+        "opd_rejected_draft_offsets": offsets,
+    }
+    decay = 0.5
+    cfg = SimpleNamespace(
+        loss_mode="k3",
+        loss_max_clamp=None,
+        log_prob_min_clamp=None,
+        use_policy_gradient=False,
+        reverse_kl_weight=0.0,
+        forward_kl_weight=1.0,
+        rejected_draft_use_reverse_kl=True,
+        rejected_draft_position_decay_enabled=True,
+        rejected_draft_position_decay=decay,
+        response_stream_weight=1.0,
+        rejected_draft_stream_weight=1.0,
+        onpolicy_reverse_enabled=True,
+    )
+    # Pollute BOTH engine counts (99 raw, 77 effective) to prove the paradistill override ignores them.
+    config = SimpleNamespace(
+        loss_agg_mode="token-mean",
+        global_batch_info={
+            "batch_num_tokens": 3.0,
+            "opd_rejected_draft_batch_num_tokens": 99.0,
+            "opd_rejected_draft_batch_effective_num_tokens": 77.0,
+            "dp_size": 1,
+        },
+    )
+    loss, _ = distillation_loss(config, SimpleNamespace(distillation_loss=cfg), model_output, data, dp_group=None)
+
+    s = torch.tensor([-0.4, -0.9, -0.3])
+    t = torch.tensor([-0.5, -0.7, -0.6])
+    sp, tp = s.exp(), t.exp()
+    fwd = tp * (t - s) + (1.0 - tp) * (torch.log1p(-tp) - torch.log1p(-sp))
+    w = torch.tensor([decay**0, decay**1, decay**2])  # decay^(offset-1) = [1, 0.5, 0.25]
+    rev = kl_penalty(logq_yhat.squeeze(0), logp_yhat.squeeze(0), "k3")
+    # numerator reverse = sum_j w_j * rev_j ; denom reverse = sum_j w_j (= 1.75)
+    expected = (fwd.sum() + (w * rev).sum()) / (1.0 * 3.0 + 1.0 * w.sum())
+    assert torch.allclose(loss, expected, atol=1e-6)
+
+
 def test_fused_handles_empty_selection():
     student = object.__new__(ComposedDFlashStudentForCausalLM)
     draft_hidden, teacher_logits, output_embeddings, *_ = _make_inputs()

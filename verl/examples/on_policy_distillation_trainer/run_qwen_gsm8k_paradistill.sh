@@ -22,7 +22,9 @@ ANCHOR_SEED=${ANCHOR_SEED:-42}
 # Response stream = Bernoulli forward only; the reverse term comes from the fresh on-policy samples.
 export FORWARD_KL_WEIGHT=${FORWARD_KL_WEIGHT:-1.0}
 export REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT:-0.0}
-# No rejected-draft position decay -> every reverse token weighted equally.
+# Optional per-offset decay on the reverse stream: weight each fresh sample by decay^(offset-1), where
+# offset (1..K) is the draft head index within its block. Default off (uniform). Set =True (and tune
+# REJECTED_DRAFT_POSITION_DECAY, the decay factor) to down-weight far-offset on-policy samples.
 export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED:-False}
 
 DRAFT_SAMPLE_TEMPERATURE=${DRAFT_SAMPLE_TEMPERATURE:-1.0}

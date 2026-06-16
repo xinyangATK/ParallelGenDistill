@@ -721,24 +721,26 @@ def distillation_loss(
             if global_response_count is None:
                 global_response_count = response_count
             global_rejected_count = global_batch_info.get("opd_rejected_draft_batch_num_tokens")
-            if loss_config.onpolicy_reverse_enabled:
-                # Anchored Block-OPD paradistill re-samples a fresh draft token per (block, offset) slot and
-                # computes the reverse loss on ALL of them (overlapping sampled-mode blocks are kept, not
-                # deduped), so N_rejected = total slots = block_size * block_num. The engine's
-                # opd_rejected_draft_batch_num_tokens counts the (ignored) rollout rejects, so all-reduce
-                # the actual local slot count instead (a no-op on CPU / single rank).
-                global_rejected_count = _global_sum(rejected_count, dp_group)
-            elif global_rejected_count is None:
-                global_rejected_count = rejected_count
             global_rejected_effective_count = global_batch_info.get(
                 "opd_rejected_draft_batch_effective_num_tokens"
             )
-            if global_rejected_effective_count is None:
-                global_rejected_effective_count = (
-                    _global_sum(rejected_effective_count, dp_group)
-                    if rejected_position_decay_applied
-                    else _scalar_like(global_rejected_count, rejected_effective_count)
-                )
+            if loss_config.onpolicy_reverse_enabled:
+                # Anchored Block-OPD paradistill re-samples a fresh draft token per (block, offset) slot and
+                # computes the reverse loss on ALL of them (overlapping sampled-mode blocks are kept, not
+                # deduped). Each slot may be decayed by its offset (decay^(offset-1)). The engine's counts
+                # reflect the IGNORED rollout rejects, so all-reduce the actual local slot count and the
+                # local decay-weight sum instead (a no-op on CPU / single rank).
+                global_rejected_count = _global_sum(rejected_count, dp_group)
+                global_rejected_effective_count = _global_sum(rejected_effective_count, dp_group)
+            else:
+                if global_rejected_count is None:
+                    global_rejected_count = rejected_count
+                if global_rejected_effective_count is None:
+                    global_rejected_effective_count = (
+                        _global_sum(rejected_effective_count, dp_group)
+                        if rejected_position_decay_applied
+                        else _scalar_like(global_rejected_count, rejected_effective_count)
+                    )
             denom = (
                 response_weight * _scalar_like(global_response_count, response_count)
                 + rejected_weight * _scalar_like(global_rejected_effective_count, rejected_effective_count)
