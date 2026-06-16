@@ -56,7 +56,25 @@ def test_free_response_anchors_clamp_and_sampled():
         response_len=20, num_predict=3, mode="sampled", sample_ratio=0.5, seed=7
     )
     assert sampled_a == sampled_b  # reproducible given the seed
-    assert sampled_a[0][0] == -1  # first anchor always kept
+    a_anchors, _ = sampled_a
+    assert a_anchors[0] == -1                  # prompt-end anchor always kept
+    assert len(a_anchors) == round(0.5 * 20)   # EXACTLY round(ratio * N) anchors, N = response_len
+    assert a_anchors == sorted(a_anchors)      # -1 first, response anchors ascending
+    assert 19 not in a_anchors                 # last response token (response_len-1) is never an anchor
+    assert all(-1 <= x <= 18 for x in a_anchors)
+
+
+def test_free_response_anchors_sampled_count_edges():
+    # ratio=1.0 -> every candidate (-1 + positions 0..response_len-2) = response_len anchors.
+    full, _ = ComposedDFlashStudentForCausalLM._build_free_response_anchors(
+        response_len=10, num_predict=3, mode="sampled", sample_ratio=1.0, seed=1
+    )
+    assert full == list(range(-1, 9))          # all candidates, none dropped
+    # tiny ratio that rounds below 1 still keeps at least the -1 anchor.
+    tiny, _ = ComposedDFlashStudentForCausalLM._build_free_response_anchors(
+        response_len=10, num_predict=3, mode="sampled", sample_ratio=0.01, seed=1
+    )
+    assert tiny == [-1]
 
 
 def test_build_opd_anchor_plan_stride_k_mode_uses_free_anchors():

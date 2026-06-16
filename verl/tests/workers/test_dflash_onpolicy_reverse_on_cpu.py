@@ -1,10 +1,10 @@
 """CPU tests for Anchored Block-OPD paradistill (verl_dflash_onpolicy_reverse_enabled).
 
 paradistill replaces the rollout-reject reverse stream with a fresh on-policy draft sample drawn at each
-response-prediction position. The genuinely new code is the inline sampler/scorer
-``_sample_and_score_onpolicy_reverse``: it samples y_hat ~ q from the draft head (at T_draft), pairs
-log q(y_hat) [grad] with the frozen teacher's log p(y_hat) [no grad] at the same position, and is the
-only new path feeding the otherwise-unchanged rejected-draft k3 reverse loss.
+response-prediction position. The genuinely new code is the fused sampler/scorer
+``_compute_response_and_reverse_log_probs``: from ONE draft->vocab projection per slot it returns the
+response-forward log q(y_j) and the reverse pair log q(y_hat) [grad] / log p(y_hat) [no grad] for a
+fresh y_hat ~ q drawn at T_draft, feeding the otherwise-unchanged rejected-draft k3 reverse loss.
 """
 
 from types import SimpleNamespace
@@ -27,113 +27,97 @@ def _make_inputs(seed: int = 0):
     batch_indices = torch.tensor([0, 0, 1], dtype=torch.long)
     draft_indices = torch.tensor([1, 3, 2], dtype=torch.long)
     row_indices = torch.tensor([2, 4, 3], dtype=torch.long)
-    return draft_hidden, teacher_logits, output_embeddings, batch_indices, draft_indices, row_indices
+    token_ids = torch.tensor([0, 2, 1], dtype=torch.long)  # realized y_j per slot (response-forward term)
+    return draft_hidden, teacher_logits, output_embeddings, batch_indices, draft_indices, row_indices, token_ids
 
 
-def test_onpolicy_reverse_logprobs_match_gathered_distributions():
-    student = object.__new__(ComposedDFlashStudentForCausalLM)
-    draft_hidden, teacher_logits, output_embeddings, b_idx, d_idx, r_idx = _make_inputs()
-
-    gen = torch.Generator().manual_seed(123)
-    log_q, log_p, sampled = student._sample_and_score_onpolicy_reverse(
+def _fused(student, draft_hidden, teacher_logits, output_embeddings, b_idx, d_idx, r_idx, t_idx, *,
+           chunk_size=64, sample_temperature=1.0, calculate_entropy=False, generator=None):
+    return student._compute_response_and_reverse_log_probs(
         draft_hidden=draft_hidden,
-        teacher_logits=teacher_logits,
         output_embeddings=output_embeddings,
         batch_indices=b_idx,
         draft_indices=d_idx,
+        token_ids=t_idx,
+        teacher_logits=teacher_logits,
         row_indices=r_idx,
-        chunk_size=64,
-        sample_temperature=1.0,
-        generator=gen,
+        chunk_size=chunk_size,
+        calculate_entropy=calculate_entropy,
+        sample_temperature=sample_temperature,
+        generator=generator,
     )
 
-    # log q(y_hat) is the draft head logprob (T=1) at the drawn token, gathered from the same hidden.
-    draft_logits = output_embeddings(draft_hidden[b_idx, d_idx, :]).float()
-    expected_log_q = F.log_softmax(draft_logits, dim=-1).gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
-    assert torch.allclose(log_q, expected_log_q, atol=1e-6)
 
-    # log p(y_hat) is the frozen teacher's realized-prefix distribution at row_indices, gathered at y_hat.
-    teacher_sel = teacher_logits[b_idx, r_idx, :].float()
-    expected_log_p = F.log_softmax(teacher_sel, dim=-1).gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
-    assert torch.allclose(log_p, expected_log_p, atol=1e-6)
-
-    assert sampled.shape == log_q.shape == log_p.shape == (b_idx.numel(),)
-    assert sampled.min() >= 0 and sampled.max() < draft_logits.shape[-1]
-
-
-def test_onpolicy_reverse_sampling_is_reproducible_with_seed():
+def test_fused_response_and_reverse_logprobs_match_gathered_distributions():
     student = object.__new__(ComposedDFlashStudentForCausalLM)
-    draft_hidden, teacher_logits, output_embeddings, b_idx, d_idx, r_idx = _make_inputs()
+    draft_hidden, teacher_logits, output_embeddings, b_idx, d_idx, r_idx, t_idx = _make_inputs()
+
+    resp_log_q, resp_entropy, log_q, log_p, sampled = _fused(
+        student, draft_hidden, teacher_logits, output_embeddings, b_idx, d_idx, r_idx, t_idx,
+        generator=torch.Generator().manual_seed(123),
+    )
+    draft_log_probs = F.log_softmax(output_embeddings(draft_hidden[b_idx, d_idx, :]).float(), dim=-1)
+
+    # response-forward term: log q(y_j) at the realized token, from the shared projection
+    assert torch.allclose(resp_log_q, draft_log_probs.gather(-1, t_idx.unsqueeze(-1)).squeeze(-1), atol=1e-6)
+    assert resp_entropy is None  # calculate_entropy=False
+    # reverse term: log q(y_hat) from the SAME draft log-probs at the drawn token
+    assert torch.allclose(log_q, draft_log_probs.gather(-1, sampled.unsqueeze(-1)).squeeze(-1), atol=1e-6)
+    # log p(y_hat): frozen teacher's realized-prefix distribution at row_indices, gathered at y_hat
+    teacher_lp = F.log_softmax(teacher_logits[b_idx, r_idx, :].float(), dim=-1)
+    assert torch.allclose(log_p, teacher_lp.gather(-1, sampled.unsqueeze(-1)).squeeze(-1), atol=1e-6)
+
+    assert resp_log_q.shape == log_q.shape == log_p.shape == sampled.shape == (b_idx.numel(),)
+    assert sampled.min() >= 0 and sampled.max() < draft_log_probs.shape[-1]
+
+
+def test_fused_reverse_sampling_is_reproducible_with_seed():
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    inputs = _make_inputs()
 
     def _draw():
-        return student._sample_and_score_onpolicy_reverse(
-            draft_hidden=draft_hidden,
-            teacher_logits=teacher_logits,
-            output_embeddings=output_embeddings,
-            batch_indices=b_idx,
-            draft_indices=d_idx,
-            row_indices=r_idx,
-            chunk_size=64,
-            sample_temperature=0.7,
-            generator=torch.Generator().manual_seed(7),
-        )[2]
+        return _fused(student, *inputs, sample_temperature=0.7, generator=torch.Generator().manual_seed(7))[4]
 
     assert torch.equal(_draw(), _draw())
 
 
-def test_onpolicy_reverse_grad_flows_only_through_student_logprob():
+def test_fused_grad_flows_through_both_student_terms_not_teacher():
     student = object.__new__(ComposedDFlashStudentForCausalLM)
-    draft_hidden, teacher_logits, output_embeddings, b_idx, d_idx, r_idx = _make_inputs()
+    draft_hidden, teacher_logits, output_embeddings, b_idx, d_idx, r_idx, t_idx = _make_inputs()
     draft_hidden.requires_grad_(True)
 
-    gen = torch.Generator().manual_seed(5)
-    log_q, log_p, _ = student._sample_and_score_onpolicy_reverse(
-        draft_hidden=draft_hidden,
-        teacher_logits=teacher_logits,
-        output_embeddings=output_embeddings,
-        batch_indices=b_idx,
-        draft_indices=d_idx,
-        row_indices=r_idx,
+    resp_log_q, _, log_q, log_p, _ = _fused(
+        student, draft_hidden, teacher_logits, output_embeddings, b_idx, d_idx, r_idx, t_idx,
         chunk_size=2,  # exercise multi-chunk path
-        sample_temperature=1.0,
-        generator=gen,
+        generator=torch.Generator().manual_seed(5),
     )
-
-    assert log_q.requires_grad
+    assert resp_log_q.requires_grad and log_q.requires_grad  # both student terms differentiable
     assert not log_p.requires_grad  # teacher term is detached (no_grad)
-    log_q.sum().backward()
-    assert draft_hidden.grad is not None
-    # gradient only reaches the selected draft rows
+    # both forward (y_j) and reverse (y_hat) backprop into draft_hidden -- gradient-identical to two
+    # separate projections (they sum at the shared draft log-probs).
+    (resp_log_q.sum() + log_q.sum()).backward()
     touched = draft_hidden.grad.abs().sum(dim=-1) > 0
     assert touched[0, 1] and touched[0, 3] and touched[1, 2]
 
 
-def test_onpolicy_reverse_keeps_overlapping_slots_without_dedup():
-    # Two slots target the SAME sequence row (row 2) but come from different draft blocks (draft cols 1
-    # and 3). They re-sample independently, so the helper must return one entry per slot (no dedup),
-    # each scored against the same teacher row but at its own sampled token.
+def test_fused_reverse_keeps_overlapping_slots_without_dedup():
+    # Two slots target the SAME sequence row (row 2) but come from different draft blocks (cols 1 and 3).
+    # They re-sample independently, so the helper returns one entry per slot (no dedup).
     student = object.__new__(ComposedDFlashStudentForCausalLM)
     draft_hidden, teacher_logits, output_embeddings, *_ = _make_inputs()
     b_idx = torch.tensor([0, 0], dtype=torch.long)
-    d_idx = torch.tensor([1, 3], dtype=torch.long)  # distinct blocks -> distinct draft heads
-    r_idx = torch.tensor([2, 2], dtype=torch.long)  # same target row (overlap)
+    d_idx = torch.tensor([1, 3], dtype=torch.long)
+    r_idx = torch.tensor([2, 2], dtype=torch.long)
+    t_idx = torch.tensor([0, 1], dtype=torch.long)
 
-    log_q, log_p, sampled = student._sample_and_score_onpolicy_reverse(
-        draft_hidden=draft_hidden,
-        teacher_logits=teacher_logits,
-        output_embeddings=output_embeddings,
-        batch_indices=b_idx,
-        draft_indices=d_idx,
-        row_indices=r_idx,
-        chunk_size=64,
-        sample_temperature=1.0,
+    _, _, log_q, log_p, sampled = _fused(
+        student, draft_hidden, teacher_logits, output_embeddings, b_idx, d_idx, r_idx, t_idx,
         generator=torch.Generator().manual_seed(0),
     )
     assert log_q.shape == log_p.shape == sampled.shape == (2,)  # both overlapping slots kept
-    # each slot's log q comes from its own draft head/column
     for k, col in enumerate(d_idx.tolist()):
-        draft_logits = output_embeddings(draft_hidden[0, col]).float()
-        assert torch.allclose(log_q[k], F.log_softmax(draft_logits, -1)[sampled[k]], atol=1e-6)
+        draft_lp = F.log_softmax(output_embeddings(draft_hidden[0, col]).float(), -1)
+        assert torch.allclose(log_q[k], draft_lp[sampled[k]], atol=1e-6)
 
 
 def _nested_logprobs(vals):
@@ -201,18 +185,12 @@ def test_paradistill_loss_uses_flat_slot_count_with_overlap_and_ignores_polluted
     assert torch.allclose(loss, expected, atol=1e-6)
 
 
-def test_onpolicy_reverse_handles_empty_selection():
+def test_fused_handles_empty_selection():
     student = object.__new__(ComposedDFlashStudentForCausalLM)
     draft_hidden, teacher_logits, output_embeddings, *_ = _make_inputs()
     empty = torch.empty((0,), dtype=torch.long)
-    log_q, log_p, sampled = student._sample_and_score_onpolicy_reverse(
-        draft_hidden=draft_hidden,
-        teacher_logits=teacher_logits,
-        output_embeddings=output_embeddings,
-        batch_indices=empty,
-        draft_indices=empty,
-        row_indices=empty,
-        chunk_size=8,
-        sample_temperature=1.0,
+    resp_log_q, resp_entropy, log_q, log_p, sampled = _fused(
+        student, draft_hidden, teacher_logits, output_embeddings, empty, empty, empty, empty, chunk_size=8
     )
-    assert log_q.numel() == 0 and log_p.numel() == 0 and sampled.numel() == 0
+    assert resp_log_q.numel() == log_q.numel() == log_p.numel() == sampled.numel() == 0
+    assert resp_entropy is None

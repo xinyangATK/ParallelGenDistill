@@ -489,43 +489,55 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         selected_entropy = torch.cat(entropy_chunks, dim=0) if calculate_entropy else None
         return selected_log_probs, selected_entropy
 
-    def _sample_and_score_onpolicy_reverse(
+    def _compute_response_and_reverse_log_probs(
         self,
         *,
         draft_hidden: torch.Tensor,
-        teacher_logits: torch.Tensor,
         output_embeddings: torch.nn.Module,
         batch_indices: torch.LongTensor,
         draft_indices: torch.LongTensor,
+        token_ids: torch.LongTensor,
+        teacher_logits: torch.Tensor,
         row_indices: torch.LongTensor,
         chunk_size: int,
+        calculate_entropy: bool,
         sample_temperature: float,
         generator: Optional[torch.Generator] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Anchored Block-OPD paradistill: draw a fresh on-policy draft sample and score it.
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Anchored Block-OPD paradistill fused LM-head pass: from ONE draft->vocab projection per slot,
+        return both the response-forward and the on-policy reverse terms.
 
-        At each selected position ``(batch_indices, draft_indices)`` it samples ``y_hat ~ q_phi^(j)`` from
-        the draft head at ``sample_temperature`` and returns:
-          - ``log q(y_hat)`` from the same draft head at temperature 1 (with gradient) -- the student term;
-          - ``log p(y_hat)`` from the frozen teacher logits at ``row_indices`` (no gradient) -- the teacher
-            term, i.e. the realized-prefix distribution p(.|s_t, y_<j) gathered at ``y_hat``;
-          - the sampled token ids ``y_hat``.
-        ``log q`` uses temperature 1 so the downstream k3 reverse-KL is an unbiased estimate of
-        KL(q||p) when ``sample_temperature == 1``.
+        At each ``(batch_indices, draft_indices)`` slot it computes the draft log-probs ONCE and returns:
+          - ``log q(y_j)`` gathered at the realized response token ``token_ids`` (with gradient) -- the
+            response-forward term -- plus optional draft entropy;
+          - a fresh draft sample ``y_hat ~ q_phi^(j)`` drawn at ``sample_temperature`` (no gradient) with
+            ``log q(y_hat)`` from the SAME log-probs (with gradient) and ``log p(y_hat)`` from the frozen
+            teacher logits at ``row_indices`` (no gradient) -- the reverse term -- plus ``y_hat`` ids.
+        Gradients are identical to projecting twice: both gathers backprop through the shared log-probs
+        into ``draft_hidden`` (the head is the frozen main-model head, so only draft params get grad).
+        ``log q`` uses temperature 1 so the k3 reverse-KL is unbiased when ``sample_temperature == 1``.
         """
         if batch_indices.numel() == 0:
             empty = draft_hidden.new_empty((0,), dtype=torch.float32)
             empty_ids = batch_indices.new_empty((0,), dtype=torch.long)
-            return empty, empty, empty_ids
+            return empty, (empty if calculate_entropy else None), empty, empty, empty_ids
 
         selected_hidden = draft_hidden[batch_indices, draft_indices, :]
-        log_q_chunks: list[torch.Tensor] = []
-        log_p_chunks: list[torch.Tensor] = []
+        resp_log_q_chunks: list[torch.Tensor] = []
+        entropy_chunks: list[torch.Tensor] = []
+        rev_log_q_chunks: list[torch.Tensor] = []
+        rev_log_p_chunks: list[torch.Tensor] = []
         sample_chunks: list[torch.Tensor] = []
         for start in range(0, selected_hidden.shape[0], chunk_size):
             end = min(start + chunk_size, selected_hidden.shape[0])
             draft_logits = output_embeddings(selected_hidden[start:end]).float()
-            draft_log_probs = F.log_softmax(draft_logits, dim=-1)
+            draft_log_probs = F.log_softmax(draft_logits, dim=-1)  # shared by both terms
+            # response-forward term: log q at the realized token y_j
+            resp_labels = token_ids[start:end].to(device=draft_log_probs.device)
+            resp_log_q_chunks.append(draft_log_probs.gather(dim=-1, index=resp_labels.unsqueeze(-1)).squeeze(-1))
+            if calculate_entropy:
+                entropy_chunks.append(-(draft_log_probs.exp() * draft_log_probs).sum(dim=-1))
+            # on-policy reverse term: sample y_hat ~ q at T_draft, reuse draft_log_probs for log q(y_hat)
             with torch.no_grad():
                 sample_probs = F.softmax(draft_logits / sample_temperature, dim=-1)
                 sampled = torch.multinomial(sample_probs, num_samples=1, generator=generator).squeeze(-1)
@@ -533,15 +545,16 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     batch_indices[start:end], row_indices[start:end], :
                 ].float()
                 teacher_log_probs = F.log_softmax(teacher_chunk_logits, dim=-1)
-                log_p = teacher_log_probs.gather(dim=-1, index=sampled.unsqueeze(-1)).squeeze(-1)
-            log_q = draft_log_probs.gather(dim=-1, index=sampled.unsqueeze(-1)).squeeze(-1)
-            log_q_chunks.append(log_q)
-            log_p_chunks.append(log_p)
+                rev_log_p_chunks.append(teacher_log_probs.gather(dim=-1, index=sampled.unsqueeze(-1)).squeeze(-1))
+            rev_log_q_chunks.append(draft_log_probs.gather(dim=-1, index=sampled.unsqueeze(-1)).squeeze(-1))
             sample_chunks.append(sampled)
 
+        resp_entropy = torch.cat(entropy_chunks, dim=0) if calculate_entropy else None
         return (
-            torch.cat(log_q_chunks, dim=0),
-            torch.cat(log_p_chunks, dim=0),
+            torch.cat(resp_log_q_chunks, dim=0),
+            resp_entropy,
+            torch.cat(rev_log_q_chunks, dim=0),
+            torch.cat(rev_log_p_chunks, dim=0),
             torch.cat(sample_chunks, dim=0),
         )
 
@@ -602,16 +615,19 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         the next ``segment_len`` response tokens (positions ``a+1 .. a+segment_len``); ``segment_len``
         is capped at ``num_predict`` (= draft block heads) and clamped to the response end. Modes:
           - ``stride_k``: non-overlapping blocks covering the response (anchors at -1, -1+K, ...).
-          - ``sampled``: keep each candidate position with prob ``sample_ratio`` (always keep -1).
+          - ``sampled``: pick EXACTLY ``round(sample_ratio * response_len)`` anchors total (N = real
+            response length, padding-free). The prompt-end anchor ``-1`` is always one of them and the
+            remaining are drawn without replacement from response positions ``0 .. response_len-2`` (the
+            last response token is never an anchor). At least the ``-1`` anchor is always kept.
         """
         if response_len <= 0 or num_predict <= 0:
             return [], []
         last = response_len - 1  # last response position usable as a prediction target
         if mode == "sampled":
             rng = random.Random(int(seed))
-            candidates = [a for a in range(-1, last) if rng.random() < sample_ratio]
-            if -1 not in candidates:
-                candidates.insert(0, -1)
+            pool = list(range(0, last))  # response anchor positions, excluding -1 and the last token
+            num_anchors = max(1, min(round(sample_ratio * response_len), len(pool) + 1))
+            candidates = [-1] + sorted(rng.sample(pool, num_anchors - 1))
         elif mode == "stride_k":
             candidates = list(range(-1, last, num_predict))
         else:
@@ -1299,43 +1315,46 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 response_draft_tensor = torch.cat(response_draft_indices, dim=0)
                 response_row_tensor = torch.cat(response_row_indices, dim=0)
                 response_label_tensor = torch.cat(response_labels, dim=0)
-                selected_log_probs, selected_entropy = self._compute_selected_lm_log_probs(
-                    draft_hidden=draft_hidden,
-                    output_embeddings=output_embeddings,
-                    batch_indices=response_batch_tensor,
-                    draft_indices=response_draft_tensor,
-                    token_ids=response_label_tensor,
-                    chunk_size=lm_head_chunk_size,
-                    calculate_entropy=calculate_entropy,
-                )
-                log_probs_by_seq[response_batch_tensor, response_row_tensor] = selected_log_probs
-                loss_mask_by_seq[response_batch_tensor, response_row_tensor] = 1.0
-                if entropy_by_seq is not None and selected_entropy is not None:
-                    entropy_by_seq[response_batch_tensor, response_row_tensor] = selected_entropy
-                response_lm_token_count = response_batch_tensor.numel()
-
                 if onpolicy_reverse_enabled:
-                    # paradistill: for each re-sampled (block, offset) slot draw a fresh draft sample
-                    # y_hat ~ q_phi^(j) and pair log q(y_hat) [grad] with the teacher's log p(y_hat)
-                    # [no grad]. response_*_tensor already holds one entry per slot WITH overlap
-                    # duplicates (sampled-mode anchors), so keeping them flat computes the reverse loss
-                    # on every re-sampled block instead of deduping to one-per-position.
+                    # paradistill: ONE draft->vocab projection per slot yields both the response-forward
+                    # log q(y_j) AND a fresh on-policy reverse sample y_hat with log q(y_hat) [grad] /
+                    # log p(y_hat) [no grad]. Slots stay flat (overlap duplicates of sampled-mode anchors
+                    # retained), so the reverse loss is computed on every re-sampled block.
                     sample_generator = None
                     if draft_sample_seed >= 0:
                         sample_generator = torch.Generator(device=draft_hidden.device).manual_seed(
                             int(draft_sample_seed)
                         )
-                    onpolicy_flat_log_q, onpolicy_flat_log_p, _ = self._sample_and_score_onpolicy_reverse(
+                    selected_log_probs, selected_entropy, onpolicy_flat_log_q, onpolicy_flat_log_p, _ = (
+                        self._compute_response_and_reverse_log_probs(
+                            draft_hidden=draft_hidden,
+                            output_embeddings=output_embeddings,
+                            batch_indices=response_batch_tensor,
+                            draft_indices=response_draft_tensor,
+                            token_ids=response_label_tensor,
+                            teacher_logits=teacher_logits,
+                            row_indices=response_row_tensor,
+                            chunk_size=lm_head_chunk_size,
+                            calculate_entropy=calculate_entropy,
+                            sample_temperature=draft_sample_temperature,
+                            generator=sample_generator,
+                        )
+                    )
+                else:
+                    selected_log_probs, selected_entropy = self._compute_selected_lm_log_probs(
                         draft_hidden=draft_hidden,
-                        teacher_logits=teacher_logits,
                         output_embeddings=output_embeddings,
                         batch_indices=response_batch_tensor,
                         draft_indices=response_draft_tensor,
-                        row_indices=response_row_tensor,
+                        token_ids=response_label_tensor,
                         chunk_size=lm_head_chunk_size,
-                        sample_temperature=draft_sample_temperature,
-                        generator=sample_generator,
+                        calculate_entropy=calculate_entropy,
                     )
+                log_probs_by_seq[response_batch_tensor, response_row_tensor] = selected_log_probs
+                loss_mask_by_seq[response_batch_tensor, response_row_tensor] = 1.0
+                if entropy_by_seq is not None and selected_entropy is not None:
+                    entropy_by_seq[response_batch_tensor, response_row_tensor] = selected_entropy
+                response_lm_token_count = response_batch_tensor.numel()
 
             if onpolicy_reverse_enabled:
                 # paradistill feeds the flat fresh-sample reverse stream through the rejected-draft channel as
