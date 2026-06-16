@@ -1,4 +1,4 @@
-description: Anchored-Block parallel-OPD (paradistill, scalar free-anchor, on-policy reverse)
+description: paradistill (scalar free-anchor, on-policy reverse)
 # ---------------------------------------------------------------------------
 # Usage (from the repo root, in your `amlt` conda env):
 #
@@ -94,7 +94,7 @@ jobs:
       - export DISTILLATION_LOSS_MODE=${DISTILLATION_LOSS_MODE}
       - export train_epochs=${train_epochs}
       - export EXP_NAME=$${AMLT_EXPERIMENT_NAME:-paradistill}
-      # ---- Anchored Block-OPD (paradistill) knobs ----
+      # ---- paradistill knobs ----
       - export ANCHOR_MODE=${ANCHOR_MODE}
       - export ANCHOR_SAMPLE_RATIO=${ANCHOR_SAMPLE_RATIO}
       - export DRAFT_SAMPLE_TEMPERATURE=${DRAFT_SAMPLE_TEMPERATURE}
@@ -108,7 +108,7 @@ jobs:
       # ---- Pre-cache HF models once (best-effort) ----
       - hf download "${MAIN_MODEL_PATH}" >/dev/null 2>&1 || true
       - hf download "${DRAFT_MODEL_PATH}" >/dev/null 2>&1 || true
-      # ---- Run Anchored Block-OPD (paradistill) ----
+      # ---- Run paradistill ----
       - bash verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_paradistill.sh "data.val_files=$${VAL_FILES}"
     submit_args:
       env:

@@ -1,4 +1,4 @@
-"""CPU tests for Anchored Block-OPD paradistill (verl_dflash_onpolicy_reverse_enabled).
+"""CPU tests for paradistill (verl_dflash_onpolicy_reverse_enabled).
 
 paradistill replaces the rollout-reject reverse stream with a fresh on-policy draft sample drawn at each
 response-prediction position. The genuinely new code is the fused sampler/scorer

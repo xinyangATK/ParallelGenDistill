@@ -1,4 +1,4 @@
-"""CPU tests for Anchored Block-OPD free anchors (verl_dflash_response_anchor_mode).
+"""CPU tests for paradistill free anchors (verl_dflash_response_anchor_mode).
 
 Free (stride_k / sampled) anchors reuse the existing DFLASH OPD anchor plan + forward + scalar
 two-stream loss; only the response-anchor selection changes. These tests cover the free-anchor

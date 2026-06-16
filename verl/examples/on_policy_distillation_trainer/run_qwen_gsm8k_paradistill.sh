@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Anchored Block-OPD (paradistill) launcher -- on-policy reverse on fresh draft samples.
+# paradistill launcher -- on-policy reverse on fresh draft samples.
 #
 # Free anchors (verl_dflash_response_anchor_mode, default stride_k) cover the response independently of
 # SD reject positions, reusing the draftopd scalar two-stream loss (no rollout/engine changes -- only

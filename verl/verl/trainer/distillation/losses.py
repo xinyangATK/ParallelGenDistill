@@ -725,7 +725,7 @@ def distillation_loss(
                 "opd_rejected_draft_batch_effective_num_tokens"
             )
             if loss_config.onpolicy_reverse_enabled:
-                # Anchored Block-OPD paradistill re-samples a fresh draft token per (block, offset) slot and
+                # paradistill re-samples a fresh draft token per (block, offset) slot and
                 # computes the reverse loss on ALL of them (overlapping sampled-mode blocks are kept, not
                 # deduped). Each slot may be decayed by its offset (decay^(offset-1)). The engine's counts
                 # reflect the IGNORED rollout rejects, so all-reduce the actual local slot count and the

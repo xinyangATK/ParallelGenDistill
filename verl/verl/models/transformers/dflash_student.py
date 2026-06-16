@@ -339,7 +339,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         return int(value)
 
     def _get_response_anchor_mode(self) -> str:
-        """Anchored Block-OPD anchor selection: 'reject' (default, SD-reject-driven) or a free mode
+        """paradistill anchor selection: 'reject' (default, SD-reject-driven) or a free mode
         ('stride_k' | 'sampled') that covers the response independently of reject positions."""
         value = getattr(self.config, "verl_dflash_response_anchor_mode", None)
         if value is None:
@@ -362,7 +362,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         return int(value)
 
     def _get_onpolicy_reverse_enabled(self) -> bool:
-        """Anchored Block-OPD paradistill: enable the on-policy reverse stream on fresh draft samples instead
+        """paradistill: enable the on-policy reverse stream on fresh draft samples instead
         of the rollout-reject driven rejected-draft stream."""
         value = getattr(self.config, "verl_dflash_onpolicy_reverse_enabled", None)
         if value is None:
@@ -504,7 +504,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         sample_temperature: float,
         generator: Optional[torch.Generator] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Anchored Block-OPD paradistill fused LM-head pass: from ONE draft->vocab projection per slot,
+        """paradistill fused LM-head pass: from ONE draft->vocab projection per slot,
         return both the response-forward and the on-policy reverse terms.
 
         At each ``(batch_indices, draft_indices)`` slot it computes the draft log-probs ONCE and returns:
@@ -609,7 +609,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         sample_ratio: float,
         seed: int,
     ) -> tuple[list[int], list[int]]:
-        """Enumerate free (reject-independent) ``(anchor_resp, segment_len)`` for Anchored Block-OPD.
+        """Enumerate free (reject-independent) ``(anchor_resp, segment_len)`` for paradistill.
 
         Anchors are in response coordinates (``-1`` is the last prompt token). Anchor ``a`` distills
         the next ``segment_len`` response tokens (positions ``a+1 .. a+segment_len``); ``segment_len``
@@ -1119,7 +1119,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         draft_forward_ms = 0.0
         lm_head_ms = 0.0
 
-        # Anchored Block-OPD paradistill: replace the rollout-reject reverse stream with a fresh on-policy
+        # paradistill: replace the rollout-reject reverse stream with a fresh on-policy
         # draft sample drawn at each response-prediction position. Read the flag early so the teacher
         # forward can retain its full-vocab logits (needed to score log p(y_hat_j)).
         onpolicy_reverse_enabled = self._get_onpolicy_reverse_enabled()
