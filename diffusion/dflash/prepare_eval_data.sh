@@ -9,7 +9,7 @@
 # that one precheck while building. It's confined to THIS one-time prep process; the
 # eval/inference path stays patch-free and just reuses the cached build afterwards.
 #
-# Usage (anywhere the blob is mounted; amlt/amlt_draftopd_eval.yaml runs this as step 1):
+# Usage (anywhere the blob is mounted; amlt/amlt_eval.yaml runs this as step 1):
 #   HF_HOME=/blob/.../cache/hf DATASETS_CSV="gsm8k:128,math500:128" \
 #     bash prepare_eval_data.sh
 #

@@ -17,13 +17,14 @@ description: Draft-OPD SGLang eval (all step checkpoints)
 # Usage (name the TRAINING experiment whose checkpoints to eval == the name passed
 # to `amlt run amlt/amlt_draftopd.yaml <TRAIN_EXP_NAME>`):
 #
-#   TRAIN_EXP_NAME=<your_train_exp> amlt run amlt/amlt_draftopd_eval.yaml <eval_exp> --yes
+#   TRAIN_EXP_NAME=<your_train_exp> amlt run amlt/amlt_eval.yaml <eval_exp> --yes
 #   # parallel multi-GPU:
-#   TRAIN_EXP_NAME=myrun GPUS=8 NVLINK_SUFFIX="-NvLink" amlt run amlt/amlt_draftopd_eval.yaml myrun_eval --yes
+#   TRAIN_EXP_NAME=myrun GPUS=8 NVLINK_SUFFIX="-NvLink" amlt run amlt/amlt_eval.yaml myrun_eval --yes
 #   # explicit checkpoint dir (skip reconstruction):
-#   CKPT_DIR_OVERRIDE=/blob/.../checkpoints amlt run amlt/amlt_draftopd_eval.yaml myrun_eval --yes
+#   CKPT_DIR_OVERRIDE=/blob/.../checkpoints amlt run amlt/amlt_eval.yaml myrun_eval --yes
 #
-# Reports + .run.log land next to the checkpoints (../eval_sglang/), reused on re-runs.
+# Reports + .run.log land next to the checkpoints (../eval_sglang_<eval_exp>/, suffixed with the eval
+# experiment name so separate eval runs of the same training checkpoints don't collide), reused on re-runs.
 # ---------------------------------------------------------------------------
 
 env_defaults:
@@ -94,6 +95,8 @@ jobs:
       - export NUM_GPU=${GPUS}
       - export DATASETS_CSV="${DATASETS_CSV}"
       - export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED}
+      # ---- Eval experiment name -> suffixed onto the report dir (eval_sglang_<EXP_NAME>) ----
+      - export EXP_NAME=$${AMLT_EXPERIMENT_NAME}
       # ---- Step 1: download the eval datasets into the blob HF cache (idempotent; reused after) ----
       - bash diffusion/dflash/prepare_eval_data.sh
       # ---- Step 2: extract + sglang-bench every global_step_<N> (other bench knobs default in the script) ----

@@ -88,7 +88,7 @@ class DistillationLossConfig(BaseConfig):
     rejected_draft_use_reverse_kl: bool = False
     rejected_draft_position_decay_enabled: bool = True
     rejected_draft_position_decay: float = 0.9
-    # Anchored Block-OPD Plan A: the reverse stream is fresh on-policy draft samples co-located with the
+    # Anchored Block-OPD paradistill: the reverse stream is fresh on-policy draft samples co-located with the
     # response stream (N_rejected == N_response), so it shares the response normalization basis instead of
     # the engine's rollout-reject count. Paired with verl_dflash_onpolicy_reverse_enabled on the model.
     onpolicy_reverse_enabled: bool = False

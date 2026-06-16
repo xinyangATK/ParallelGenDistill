@@ -1,6 +1,6 @@
-"""CPU tests for Anchored Block-OPD Plan A (verl_dflash_onpolicy_reverse_enabled).
+"""CPU tests for Anchored Block-OPD paradistill (verl_dflash_onpolicy_reverse_enabled).
 
-Plan A replaces the rollout-reject reverse stream with a fresh on-policy draft sample drawn at each
+paradistill replaces the rollout-reject reverse stream with a fresh on-policy draft sample drawn at each
 response-prediction position. The genuinely new code is the inline sampler/scorer
 ``_sample_and_score_onpolicy_reverse``: it samples y_hat ~ q from the draft head (at T_draft), pairs
 log q(y_hat) [grad] with the frozen teacher's log p(y_hat) [no grad] at the same position, and is the
@@ -108,15 +108,43 @@ def test_onpolicy_reverse_grad_flows_only_through_student_logprob():
     assert touched[0, 1] and touched[0, 3] and touched[1, 2]
 
 
+def test_onpolicy_reverse_keeps_overlapping_slots_without_dedup():
+    # Two slots target the SAME sequence row (row 2) but come from different draft blocks (draft cols 1
+    # and 3). They re-sample independently, so the helper must return one entry per slot (no dedup),
+    # each scored against the same teacher row but at its own sampled token.
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    draft_hidden, teacher_logits, output_embeddings, *_ = _make_inputs()
+    b_idx = torch.tensor([0, 0], dtype=torch.long)
+    d_idx = torch.tensor([1, 3], dtype=torch.long)  # distinct blocks -> distinct draft heads
+    r_idx = torch.tensor([2, 2], dtype=torch.long)  # same target row (overlap)
+
+    log_q, log_p, sampled = student._sample_and_score_onpolicy_reverse(
+        draft_hidden=draft_hidden,
+        teacher_logits=teacher_logits,
+        output_embeddings=output_embeddings,
+        batch_indices=b_idx,
+        draft_indices=d_idx,
+        row_indices=r_idx,
+        chunk_size=64,
+        sample_temperature=1.0,
+        generator=torch.Generator().manual_seed(0),
+    )
+    assert log_q.shape == log_p.shape == sampled.shape == (2,)  # both overlapping slots kept
+    # each slot's log q comes from its own draft head/column
+    for k, col in enumerate(d_idx.tolist()):
+        draft_logits = output_embeddings(draft_hidden[0, col]).float()
+        assert torch.allclose(log_q[k], F.log_softmax(draft_logits, -1)[sampled[k]], atol=1e-6)
+
+
 def _nested_logprobs(vals):
     v = torch.as_tensor(vals, dtype=torch.float32).reshape(-1, 1)
     return torch.nested.as_nested_tensor([v], layout=torch.jagged)
 
 
-def test_plan_a_loss_mirrors_response_count_and_ignores_polluted_rejected_count():
-    # Plan A's reverse stream is co-located with the response stream (1 fresh sample per response
-    # prediction), so the loss must normalize both by the response count -- ignoring the engine's
-    # opd_rejected_draft_batch_num_tokens, which still reflects the (ignored) rollout rejects.
+def test_paradistill_loss_uses_flat_slot_count_with_overlap_and_ignores_polluted_count():
+    # paradistill keeps ALL re-sampled (block, offset) slots (overlapping sampled-mode blocks are NOT deduped),
+    # so the reverse stream has more entries than response positions and the loss must normalize it by the
+    # actual flat slot count -- not batch_num_tokens, and not the engine's rollout-reject pollution.
     data = TensorDict(
         {
             "prompts": torch.tensor([[1]]),
@@ -128,15 +156,16 @@ def test_plan_a_loss_mirrors_response_count_and_ignores_polluted_rejected_count(
         batch_size=[1],
     )
     logq_y = torch.tensor([-0.4, -0.9, -0.3, 0.0])
-    logq_yhat = torch.tensor([-1.1, -0.2, -0.8, 0.0])
-    logp_yhat = torch.tensor([-0.6, -0.5, -1.0, 0.0])
-    mask = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    mask = torch.tensor([1.0, 1.0, 1.0, 0.0])  # 3 response-forward positions
+    # 5 re-sampled reverse slots (> 3 response positions: overlapping blocks), flat (1, 5).
+    logq_yhat = torch.tensor([[-1.1, -0.2, -0.9, -0.8, -0.3]])
+    logp_yhat = torch.tensor([[-0.6, -0.5, -0.4, -1.0, -0.7]])
     model_output = {
         "log_probs": logq_y,
         "opd_loss_mask": mask,
-        "opd_rejected_draft_student_log_probs": logq_yhat.unsqueeze(0),
-        "opd_rejected_draft_teacher_log_probs": logp_yhat.unsqueeze(0),
-        "opd_rejected_draft_loss_mask": mask.bool().unsqueeze(0),
+        "opd_rejected_draft_student_log_probs": logq_yhat,
+        "opd_rejected_draft_teacher_log_probs": logp_yhat,
+        "opd_rejected_draft_loss_mask": torch.ones_like(logq_yhat, dtype=torch.bool),
     }
     cfg = SimpleNamespace(
         loss_mode="k3",
@@ -151,7 +180,7 @@ def test_plan_a_loss_mirrors_response_count_and_ignores_polluted_rejected_count(
         rejected_draft_stream_weight=1.0,
         onpolicy_reverse_enabled=True,
     )
-    # batch_num_tokens=3 is the response basis; the rejected count of 99 is the rollout-reject pollution.
+    # opd_rejected_draft_batch_num_tokens=99 is the rollout-reject pollution that must be ignored.
     config = SimpleNamespace(
         loss_agg_mode="token-mean",
         global_batch_info={
@@ -165,9 +194,10 @@ def test_plan_a_loss_mirrors_response_count_and_ignores_polluted_rejected_count(
     s = torch.tensor([-0.4, -0.9, -0.3])
     t = torch.tensor([-0.5, -0.7, -0.6])
     sp, tp = s.exp(), t.exp()
-    fwd = tp * (t - s) + (1.0 - tp) * (torch.log1p(-tp) - torch.log1p(-sp))  # Bernoulli forward on y
-    rev = kl_penalty(torch.tensor([-1.1, -0.2, -0.8]), torch.tensor([-0.6, -0.5, -1.0]), "k3")  # k3 on yhat
-    expected = (fwd.sum() + rev.sum()) / (1.0 * 3.0 + 1.0 * 3.0)  # both streams share the response basis
+    fwd = tp * (t - s) + (1.0 - tp) * (torch.log1p(-tp) - torch.log1p(-sp))  # Bernoulli forward on 3 y's
+    rev = kl_penalty(logq_yhat.squeeze(0), logp_yhat.squeeze(0), "k3")  # k3 on all 5 re-sampled yhat slots
+    # denom = w_resp * batch_num_tokens(3) + w_rej * flat_slot_count(5)
+    expected = (fwd.sum() + rev.sum()) / (1.0 * 3.0 + 1.0 * 5.0)
     assert torch.allclose(loss, expected, atol=1e-6)
 
 

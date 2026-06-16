@@ -16,7 +16,7 @@
 # evals checkpoints sequentially; an 8-GPU job evals 8 at a time.
 #
 # PREREQ: the eval datasets must already be in the HF datasets cache on the blob.
-# amlt/amlt_draftopd_eval.yaml runs prepare_eval_data.sh for you before this step; if
+# amlt/amlt_eval.yaml runs prepare_eval_data.sh for you before this step; if
 # you run this script standalone, run prepare_eval_data.sh once first (otherwise the
 # blobfuse statvfs precheck makes benchmark_sglang.py's first build fail).
 #
@@ -38,7 +38,8 @@
 #   MEM_FRACTION       mem_fraction_static                  [0.75]
 #   STEPS              optional comma list of step numbers  [all]
 #   NUM_GPU            override GPU count (else auto)        [auto]
-#   EVAL_LOG_DIR       where per-step .md reports go         [${CKPT_DIR}/../eval_sglang]
+#   EXP_NAME           suffix appended to the default report dir (eval_sglang_<EXP_NAME>) [unset]
+#   EVAL_LOG_DIR       where per-step .md reports go         [${CKPT_DIR}/../eval_sglang[_EXP_NAME]]
 #   REUSE_EXTRACTED    skip extraction if draft_model exists [true]
 # =============================================================================
 set -euo pipefail
@@ -59,7 +60,7 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8192}"
 TP_SIZE="${TP_SIZE:-1}"
 MEM_FRACTION="${MEM_FRACTION:-0.75}"
 REUSE_EXTRACTED="${REUSE_EXTRACTED:-true}"
-EVAL_LOG_DIR="${EVAL_LOG_DIR:-${CKPT_DIR%/}/../eval_sglang}"
+EVAL_LOG_DIR="${EVAL_LOG_DIR:-${CKPT_DIR%/}/../eval_sglang${EXP_NAME:+_${EXP_NAME}}}"
 
 [ -f "${EXTRACT_PY}" ] || { echo "[ERR] extractor not found: ${EXTRACT_PY}"; exit 1; }
 [ -d "${CKPT_DIR}" ]   || { echo "[ERR] CKPT_DIR does not exist: ${CKPT_DIR}"; exit 1; }
