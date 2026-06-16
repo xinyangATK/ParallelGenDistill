@@ -30,6 +30,11 @@ export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENA
 DRAFT_SAMPLE_TEMPERATURE=${DRAFT_SAMPLE_TEMPERATURE:-1.0}
 DRAFT_SAMPLE_SEED=${DRAFT_SAMPLE_SEED:--1}
 
+# Resume from the latest checkpoint under default_local_dir if present (disable | auto | resume_path).
+# Safe even on a fresh run: auto just starts from scratch when no checkpoint exists. The composed
+# student rebuilds the frozen main_model from HF and restores only the trainable draft from the ckpt.
+RESUME_MODE=${RESUME_MODE:-disable}
+
 TODAY=$(date +"%m-%d")
 export EXP_NAME=${EXP_NAME:-"paradistill/${ANCHOR_MODE}-Tdraft${DRAFT_SAMPLE_TEMPERATURE}/student-teacher-${TODAY}"}
 
@@ -41,4 +46,5 @@ exec bash "${SCRIPT_DIR}/run_qwen_gsm8k_forward-ins.sh" \
     ++actor_rollout_ref.model.override_config.verl_dflash_draft_sample_temperature="${DRAFT_SAMPLE_TEMPERATURE}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_draft_sample_seed="${DRAFT_SAMPLE_SEED}" \
     distillation.distillation_loss.onpolicy_reverse_enabled=True \
+    trainer.resume_mode="${RESUME_MODE}" \
     "$@"

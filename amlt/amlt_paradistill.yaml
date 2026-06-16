@@ -33,6 +33,9 @@ env_defaults:
   MAX_RESPONSE_LENGTH: 2048
   DISTILLATION_LOSS_MODE: k3
   train_epochs: 10
+  # Auto-resume from the latest checkpoint on the blob (Standard SLA is preemptible; checkpoints persist
+  # under is_output storage). disable | auto | resume_path. The frozen main_model is reloaded from HF.
+  RESUME_MODE: auto
 
   # ---- Paradistill knobs ----
   ANCHOR_MODE: sampled                 # stride_k | sampled
@@ -93,6 +96,7 @@ jobs:
       - export LR=${LR}
       - export DISTILLATION_LOSS_MODE=${DISTILLATION_LOSS_MODE}
       - export train_epochs=${train_epochs}
+      - export RESUME_MODE=${RESUME_MODE}
       - export EXP_NAME=$${AMLT_EXPERIMENT_NAME:-paradistill}
       # ---- paradistill knobs ----
       - export ANCHOR_MODE=${ANCHOR_MODE}

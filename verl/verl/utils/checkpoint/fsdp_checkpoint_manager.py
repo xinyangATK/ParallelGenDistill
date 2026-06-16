@@ -139,7 +139,21 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 remote_model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
                 local_model_path = copy_to_local(remote_model_path)
                 model_state_dict = torch.load(local_model_path, weights_only=False)
-                self.model.load_state_dict(model_state_dict)
+                # OPD composed students (DFLASH/EAGLE3) intentionally do NOT checkpoint the frozen
+                # `main_model.*` target -- it is rebuilt from its HF path at init. So load non-strictly:
+                # the only acceptable missing keys are that frozen target. A missing key outside
+                # main_model, or any unexpected key, is a real checkpoint/model mismatch.
+                load_result = self.model.load_state_dict(model_state_dict, strict=False)
+                unexpected_keys = list(load_result.unexpected_keys)
+                missing_trainable_keys = [
+                    key for key in load_result.missing_keys if "main_model" not in key.split(".")
+                ]
+                if unexpected_keys or missing_trainable_keys:
+                    raise RuntimeError(
+                        f"Checkpoint/model mismatch loading {remote_model_path}: "
+                        f"unexpected_keys={unexpected_keys}, "
+                        f"missing_keys (excluding frozen main_model)={missing_trainable_keys}"
+                    )
                 log_with_rank(f"Loaded model from {remote_model_path}", rank=self.rank, logger=logger)
 
             if self.should_load_optimizer:
