@@ -120,6 +120,25 @@ def test_fused_reverse_keeps_overlapping_slots_without_dedup():
         assert torch.allclose(log_q[k], draft_lp[sampled[k]], atol=1e-6)
 
 
+def test_per_sample_slot_columns_packs_overlap_into_rows():
+    # Flat per-slot batch indices -> per-sample (batch, width) columns. Sample 0 has 3 slots (incl. an
+    # overlap), sample 1 has 2; each slot must land in its own column so nothing is overwritten.
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    flat_b = torch.tensor([0, 0, 1, 0, 1], dtype=torch.long)
+    col, width = student._per_sample_slot_columns(flat_b, batch_size=2)
+    assert width == 3
+    assert col.tolist() == [0, 1, 0, 2, 1]
+    mask = torch.zeros((2, 3), dtype=torch.bool)
+    mask[flat_b, col] = True
+    assert mask.sum().item() == 5  # all slots placed, no collisions
+    assert mask[0].sum().item() == 3 and mask[1].sum().item() == 2
+
+    # a sample with zero slots is fine (batch_size > distinct batches)
+    flat_b2 = torch.tensor([0, 0, 2], dtype=torch.long)
+    col2, width2 = student._per_sample_slot_columns(flat_b2, batch_size=3)
+    assert width2 == 2 and col2.tolist() == [0, 1, 0]
+
+
 def _nested_logprobs(vals):
     v = torch.as_tensor(vals, dtype=torch.float32).reshape(-1, 1)
     return torch.nested.as_nested_tensor([v], layout=torch.jagged)

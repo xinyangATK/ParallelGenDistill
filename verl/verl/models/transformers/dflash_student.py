@@ -601,6 +601,23 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         return anchors_resp, segment_lens
 
     @staticmethod
+    def _per_sample_slot_columns(batch_indices: torch.LongTensor, batch_size: int) -> tuple[torch.LongTensor, int]:
+        """Map flat per-slot ``batch_indices`` to a per-sample (batch, width) layout.
+
+        Returns ``(col, width)`` where ``col[k]`` is the column of slot ``k`` within its sample's row
+        (its rank among that sample's slots) and ``width`` is the max slots over samples. Used to pack the
+        flat paradistill reverse stream into per-sample rows so the engine's dynamic-batch restore (which
+        reorders model outputs by sample) and the loss both see the standard (batch, width) rejected layout.
+        """
+        counts = torch.bincount(batch_indices, minlength=batch_size)
+        width = int(counts.max().item()) if batch_indices.numel() > 0 else 0
+        order = torch.argsort(batch_indices, stable=True)
+        group_start = torch.cumsum(counts, dim=0) - counts
+        col = torch.empty_like(batch_indices)
+        col[order] = torch.arange(batch_indices.numel(), device=batch_indices.device) - group_start[batch_indices[order]]
+        return col, width
+
+    @staticmethod
     def _build_free_response_anchors(
         *,
         response_len: int,
@@ -1360,18 +1377,23 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 response_lm_token_count = response_batch_tensor.numel()
 
             if onpolicy_reverse_enabled:
-                # paradistill feeds the flat fresh-sample reverse stream through the rejected-draft channel as
-                # (1, M): the loss only needs total counts + elementwise terms, not per-sample rows. The
-                # per-slot offsets (1..K) carry through so the loss can optionally decay by offset. When
-                # there are no slots the zero-initialized buffers already give an all-False mask (the loss
-                # then skips the reverse stream), so only the populated case needs handling.
+                # paradistill feeds the fresh-sample reverse stream through the rejected-draft channel.
+                # Pack the flat per-slot tensors into per-SAMPLE rows (batch, width) -- overlap duplicates
+                # kept as separate columns, per-slot offsets (1..K) carried for optional decay -- so the
+                # engine's per-sample dynamic-batch restore and the loss both see the standard layout. When
+                # there are no slots the zero-initialized (batch, rejected_width) buffers already give an
+                # all-False mask (the loss skips the reverse stream), so only the populated case is handled.
                 if onpolicy_flat_log_q is not None and onpolicy_flat_log_q.numel() > 0:
-                    rejected_student_log_probs = onpolicy_flat_log_q.unsqueeze(0)
-                    rejected_teacher_log_probs = onpolicy_flat_log_p.unsqueeze(0)
-                    rejected_loss_mask = torch.ones(
-                        (1, onpolicy_flat_log_q.shape[0]), dtype=torch.bool, device=input_ids.device
-                    )
-                    rejected_draft_offsets = onpolicy_flat_offsets.unsqueeze(0).to(torch.long)
+                    col, width = self._per_sample_slot_columns(response_batch_tensor, batch_size)
+                    rejected_student_log_probs = target_hidden.new_zeros((batch_size, width), dtype=torch.float32)
+                    rejected_teacher_log_probs = target_hidden.new_zeros((batch_size, width), dtype=torch.float32)
+                    rejected_loss_mask = torch.zeros((batch_size, width), dtype=torch.bool, device=input_ids.device)
+                    rejected_offsets = torch.zeros((batch_size, width), dtype=torch.long, device=input_ids.device)
+                    rejected_student_log_probs[response_batch_tensor, col] = onpolicy_flat_log_q
+                    rejected_teacher_log_probs[response_batch_tensor, col] = onpolicy_flat_log_p
+                    rejected_loss_mask[response_batch_tensor, col] = True
+                    rejected_offsets[response_batch_tensor, col] = onpolicy_flat_offsets.to(torch.long)
+                    rejected_draft_offsets = rejected_offsets
             elif not split_random_rejected_pass:
                 rejected_student_log_probs, rejected_teacher_log_probs, rejected_loss_mask = (
                     self._collect_rejected_draft_log_probs(
