@@ -17,7 +17,7 @@ description: paradistill (scalar free-anchor, on-policy reverse)
 # ---------------------------------------------------------------------------
 
 env_defaults:
-  SLA: Standard                 # Premium for guaranteed A100-80G capacity
+  SLA: Premium                 # Premium for guaranteed A100-80G capacity
   NODES: 1
   GPUS: 8                       # (GPUS-TEACHER_WORLD_SIZE) student + TEACHER_WORLD_SIZE teacher, one node
   MEM: 80                       # A100-80G
