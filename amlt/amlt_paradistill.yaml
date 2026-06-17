@@ -38,6 +38,7 @@ env_defaults:
   RESUME_MODE: auto
 
   # ---- Paradistill knobs ----
+  ONPOLICY_REVERSE: True               # True = forward + on-policy reverse; False = FORWARD-ONLY ablation
   ANCHOR_MODE: sampled                 # stride_k | sampled
   ANCHOR_SAMPLE_RATIO: 0.2              # only used when ANCHOR_MODE=sampled
   DRAFT_SAMPLE_TEMPERATURE: 1.0         # T_draft for the fresh on-policy draft samples (1.0 = genuine q-samples)
@@ -99,6 +100,7 @@ jobs:
       - export RESUME_MODE=${RESUME_MODE}
       - export EXP_NAME=$${AMLT_EXPERIMENT_NAME:-paradistill}
       # ---- paradistill knobs ----
+      - export ONPOLICY_REVERSE=${ONPOLICY_REVERSE}
       - export ANCHOR_MODE=${ANCHOR_MODE}
       - export ANCHOR_SAMPLE_RATIO=${ANCHOR_SAMPLE_RATIO}
       - export DRAFT_SAMPLE_TEMPERATURE=${DRAFT_SAMPLE_TEMPERATURE}

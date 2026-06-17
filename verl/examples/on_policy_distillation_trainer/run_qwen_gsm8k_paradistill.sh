@@ -35,6 +35,28 @@ DRAFT_SAMPLE_SEED=${DRAFT_SAMPLE_SEED:--1}
 # student rebuilds the frozen main_model from HF and restores only the trainable draft from the ckpt.
 RESUME_MODE=${RESUME_MODE:-disable}
 
+# ONPOLICY_REVERSE=True (default): full paradistill (response forward-KL + fresh on-policy reverse-KL).
+# ONPOLICY_REVERSE=False: FORWARD-ONLY ablation -- only the response Bernoulli forward-KL on y_j; no fresh
+# sampling AND the rollout-reject reverse stream is zeroed (rejected_draft_stream_weight=0).
+ONPOLICY_REVERSE=${ONPOLICY_REVERSE:-True}
+case "${ONPOLICY_REVERSE,,}" in
+    true | 1 | yes | on)
+        REVERSE_OVERRIDES=(
+            ++actor_rollout_ref.model.override_config.verl_dflash_onpolicy_reverse_enabled=True
+            ++actor_rollout_ref.model.override_config.verl_dflash_draft_sample_temperature="${DRAFT_SAMPLE_TEMPERATURE}"
+            ++actor_rollout_ref.model.override_config.verl_dflash_draft_sample_seed="${DRAFT_SAMPLE_SEED}"
+            distillation.distillation_loss.onpolicy_reverse_enabled=True
+        )
+        ;;
+    *)
+        REVERSE_OVERRIDES=(
+            ++actor_rollout_ref.model.override_config.verl_dflash_onpolicy_reverse_enabled=False
+            distillation.distillation_loss.onpolicy_reverse_enabled=False
+            distillation.distillation_loss.rejected_draft_stream_weight=0.0
+        )
+        ;;
+esac
+
 TODAY=$(date +"%m-%d")
 export EXP_NAME=${EXP_NAME:-"paradistill/${ANCHOR_MODE}-Tdraft${DRAFT_SAMPLE_TEMPERATURE}/student-teacher-${TODAY}"}
 
@@ -42,9 +64,6 @@ exec bash "${SCRIPT_DIR}/run_qwen_gsm8k_forward-ins.sh" \
     ++actor_rollout_ref.model.override_config.verl_dflash_response_anchor_mode="${ANCHOR_MODE}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_response_anchor_sample_ratio="${ANCHOR_SAMPLE_RATIO}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_response_anchor_seed="${ANCHOR_SEED}" \
-    ++actor_rollout_ref.model.override_config.verl_dflash_onpolicy_reverse_enabled=True \
-    ++actor_rollout_ref.model.override_config.verl_dflash_draft_sample_temperature="${DRAFT_SAMPLE_TEMPERATURE}" \
-    ++actor_rollout_ref.model.override_config.verl_dflash_draft_sample_seed="${DRAFT_SAMPLE_SEED}" \
-    distillation.distillation_loss.onpolicy_reverse_enabled=True \
+    "${REVERSE_OVERRIDES[@]}" \
     trainer.resume_mode="${RESUME_MODE}" \
     "$@"
