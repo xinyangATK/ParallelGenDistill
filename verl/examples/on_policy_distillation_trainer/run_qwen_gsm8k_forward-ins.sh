@@ -40,9 +40,10 @@ RANDOM_RESPONSE_ANCHOR_SEED=${RANDOM_RESPONSE_ANCHOR_SEED:-42}
 # draftopd top-K forward KL (computed in-model from the frozen teacher's full logits). Default off ->
 # original draftopd (scalar Bernoulli response forward + reverse KL on the rollout-rejected token).
 #   TOPK_FKL_RESPONSE=True  -> request 1: response forward term becomes a top-K forward KL.
-#   TOPK_FKL_REJECT=True    -> request 2: reject stream becomes a top-K forward KL on the draft's
-#                              full-block-depth predictions (reject position & after) vs teacher realized
-#                              top-K, instead of the reverse KL on the rejected token. Keeps offset decay.
+#   TOPK_FKL_REJECT=True    -> request 2: reject stream uses the SAME rollout-reject slots as baseline
+#                              (same anchors/block split/offsets) but a top-K forward KL vs the teacher's
+#                              realized-position top-K (teacher forcing), instead of reverse KL on the
+#                              rejected token's cached scalar. Keeps offset decay.
 #   TOPK_FKL_MODE=teacher|student|union  (which top-K index set), TOPK_FKL_K=<int>.
 TOPK_FKL_RESPONSE=${TOPK_FKL_RESPONSE:-False}
 TOPK_FKL_REJECT=${TOPK_FKL_REJECT:-False}

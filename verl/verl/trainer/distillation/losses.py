@@ -644,11 +644,8 @@ def distillation_loss(
             loss_config=loss_config,
         )
         if getattr(loss_config, "topk_fkl_reject_enabled", False):
-            # draftopd request 2: the reject stream loss is the in-model top-K forward KL on the draft's
-            # full-block-depth predictions. SEMANTIC OVERLOAD: to avoid a new model-output key, the model
-            # carries the per-slot FKL in the rejected-draft "student_log_probs" channel (teacher channel
-            # stays 0) -- so rejected_student_log_probs here is the FKL loss, not log q(d). Use it directly;
-            # the rollout-reject reverse-KL combine is bypassed. Weights / offset decay apply as usual.
+            # Request 2: SEMANTIC OVERLOAD -- rejected_student_log_probs holds the per-slot top-K FKL (not
+            # log q(d)), so use it directly; the reverse-KL combine is bypassed. Offset decay still applies.
             rejected_draft_losses = rejected_student_log_probs.to(dtype=distillation_losses.dtype)
             distillation_metrics["distillation/rejected_draft_topk_fkl_loss"] = Metric(
                 AggregationType.MEAN, _valid_mean(rejected_draft_losses, rejected_draft_mask)
@@ -930,12 +927,8 @@ def compute_distillation_loss_reverse_kl_estimator(
     - distillation_metrics: Dictionary of metrics.
     """
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
-    # draftopd request 1: the response forward term is a top-K forward KL computed in-model from the frozen
-    # teacher's full logits (student/teacher/union top-K). SEMANTIC OVERLOAD: to avoid a new model-output
-    # key (and a transformer_impl passthrough), the model writes the per-position FKL INTO the "log_probs"
-    # channel in place of the scalar log q(y_j) -- so here model_output["log_probs"] is the FKL loss, not a
-    # log-prob. Consume it directly; log q is unused in this config (forward-KL replaces the whole response
-    # loss; no reverse / no policy-gradient).
+    # Request 1: SEMANTIC OVERLOAD -- when topk_fkl_response is on, model_output["log_probs"] holds the
+    # per-position top-K FKL (not log q(y_j)), so consume it directly as the response loss.
     if getattr(loss_config, "topk_fkl_response_enabled", False):
         distillation_losses = no_padding_2_padding(model_output["log_probs"], data)
         response_mask_bool = get_effective_distillation_response_mask(data=data, model_output=model_output)

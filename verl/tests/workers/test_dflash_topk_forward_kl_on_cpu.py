@@ -48,7 +48,7 @@ def _manual_topk_fkl(draft_hidden, teacher_logits, out, b, d, r, mode, k):
     return (t_p * (t_lp - s_lp) * sel).sum(dim=-1).clamp_min(0.0)
 
 
-def _call(student, draft_hidden, teacher_logits, out, b, d, r, *, mode, k=2, token_ids=None, chunk_size=64,
+def _call(student, draft_hidden, teacher_logits, out, b, d, r, *, mode, k=2, chunk_size=64,
           calculate_entropy=False):
     return student._compute_topk_forward_kl(
         draft_hidden=draft_hidden,
@@ -60,38 +60,28 @@ def _call(student, draft_hidden, teacher_logits, out, b, d, r, *, mode, k=2, tok
         chunk_size=chunk_size,
         mode=mode,
         topk=k,
-        token_ids=token_ids,
         calculate_entropy=calculate_entropy,
     )
 
 
 def test_topk_forward_kl_matches_manual_each_mode():
     student = object.__new__(ComposedDFlashStudentForCausalLM)
-    draft_hidden, teacher_logits, out, b, d, r, t = _make_inputs()
+    draft_hidden, teacher_logits, out, b, d, r, _ = _make_inputs()
     for mode in ("teacher", "student", "union"):
-        fkl, _, _ = _call(student, draft_hidden, teacher_logits, out, b, d, r, mode=mode, k=2, chunk_size=2)
+        fkl, _ = _call(student, draft_hidden, teacher_logits, out, b, d, r, mode=mode, k=2, chunk_size=2)
         expected = _manual_topk_fkl(draft_hidden, teacher_logits, out, b, d, r, mode, k=2)
         assert torch.allclose(fkl, expected, atol=1e-6), mode
         assert fkl.shape == (b.numel(),)
-        assert (fkl >= -1e-6).all()  # forward KL over a sub-support is non-negative
+        assert (fkl >= -1e-6).all()  # clamped to >=0 (top-K mass < 1)
 
 
 def test_topk_forward_kl_union_dedups_overlapping_indices():
-    # When teacher and student top-K overlap, the boolean union mask must not double-count shared tokens:
-    # union FKL <= teacher FKL + student FKL, and equals the de-duplicated support sum.
+    # The boolean union mask must not double-count tokens shared by the teacher and student top-K.
     student = object.__new__(ComposedDFlashStudentForCausalLM)
     draft_hidden, teacher_logits, out, b, d, r, _ = _make_inputs(seed=3)
-    union, _, _ = _call(student, draft_hidden, teacher_logits, out, b, d, r, mode="union", k=3)
+    union, _ = _call(student, draft_hidden, teacher_logits, out, b, d, r, mode="union", k=3)
     manual = _manual_topk_fkl(draft_hidden, teacher_logits, out, b, d, r, "union", k=3)
     assert torch.allclose(union, manual, atol=1e-6)
-
-
-def test_topk_forward_kl_returns_realized_token_logprob():
-    student = object.__new__(ComposedDFlashStudentForCausalLM)
-    draft_hidden, teacher_logits, out, b, d, r, t = _make_inputs()
-    _, logp, _ = _call(student, draft_hidden, teacher_logits, out, b, d, r, mode="teacher", token_ids=t)
-    expected = F.log_softmax(out(draft_hidden[b, d, :]).float(), dim=-1).gather(-1, t.unsqueeze(-1)).squeeze(-1)
-    assert torch.allclose(logp, expected, atol=1e-6)
 
 
 def test_topk_forward_kl_grad_flows_through_student_only():
@@ -99,7 +89,7 @@ def test_topk_forward_kl_grad_flows_through_student_only():
     draft_hidden, teacher_logits, out, b, d, r, _ = _make_inputs()
     draft_hidden.requires_grad_(True)
     teacher_logits.requires_grad_(True)
-    fkl, _, _ = _call(student, draft_hidden, teacher_logits, out, b, d, r, mode="union", k=2, chunk_size=2)
+    fkl, _ = _call(student, draft_hidden, teacher_logits, out, b, d, r, mode="union", k=2, chunk_size=2)
     assert fkl.requires_grad
     fkl.sum().backward()
     assert teacher_logits.grad is None  # teacher term is detached (no_grad)
@@ -111,10 +101,80 @@ def test_topk_forward_kl_handles_empty_selection():
     student = object.__new__(ComposedDFlashStudentForCausalLM)
     draft_hidden, teacher_logits, out, *_ = _make_inputs()
     empty = torch.empty((0,), dtype=torch.long)
-    fkl, logp, ent = _call(student, draft_hidden, teacher_logits, out, empty, empty, empty, mode="teacher",
-                           token_ids=empty)
-    assert fkl.numel() == 0 and logp.numel() == 0
-    assert ent is None
+    fkl, ent = _call(student, draft_hidden, teacher_logits, out, empty, empty, empty, mode="teacher")
+    assert fkl.numel() == 0 and ent is None
+
+
+def test_collect_rejected_draft_topk_fkl_uses_realized_teacher_and_drops_oob():
+    # Request 2 aligns to draftopd's reject geometry: the SAME rollout-reject slots, only the loss differs.
+    # Here block_size K=3 (offsets 1,2), prompt_len=2, response_len=4 (valid_len=6), two block anchors at
+    # full positions 2 and 5. Slot A (anchor 2, offset 1) -> draft slot 1, realized target pos 3 (teacher
+    # row 2) -> kept. Slot B (anchor 5, offset 2) -> realized target pos 7 >= valid_len -> DROPPED.
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    torch.manual_seed(0)
+    hidden, vocab, K = 4, 6, 3
+    draft_hidden = torch.randn(1, 2 * K, hidden)  # 2 blocks x K slots
+    teacher_logits = torch.randn(1, 6, vocab)
+    out = torch.nn.Linear(hidden, vocab, bias=False)
+    long = lambda v: torch.tensor(v, dtype=torch.long)  # noqa: E731
+    student_t, teacher_t, mask_t = student._collect_rejected_draft_log_probs(
+        draft_hidden=draft_hidden,
+        output_embeddings=out,
+        prompt_lengths=long([2]),
+        response_lengths=long([4]),
+        anchor_positions=long([[2, 5]]),
+        block_keep_mask=torch.tensor([[True, True]]),
+        draft_block_size=K,
+        lm_head_chunk_size=64,
+        max_tokens_per_sample=None,
+        rejected_draft_anchor_indices=long([[0, 3]]),   # anchor_resp -> full 2 and 5
+        rejected_draft_offsets=long([[1, 2]]),
+        rejected_draft_token_ids=long([[3, 2]]),
+        rejected_draft_teacher_logprobs=None,           # unused for the FKL path
+        rejected_draft_mask=torch.tensor([[True, True]]),
+        compute_topk_fkl=True,
+        teacher_logits=teacher_logits,
+        topk_fkl_mode="teacher",
+        topk_fkl_k=2,
+    )
+    assert mask_t.tolist() == [[True, False]]           # slot B dropped (realized target out of bounds)
+    assert teacher_t.abs().sum() == 0                   # teacher channel unused for the FKL path
+    expected = _manual_topk_fkl(
+        draft_hidden, teacher_logits, out, torch.tensor([0]), torch.tensor([1]), torch.tensor([2]), "teacher", k=2
+    )
+    assert torch.allclose(student_t[0, 0], expected[0], atol=1e-6)  # FKL at draft slot 1 vs teacher row 2
+    assert student_t[0, 1] == 0.0
+
+
+def test_collect_rejected_draft_baseline_path_unchanged():
+    # compute_topk_fkl=False keeps the baseline reverse-stream behavior: student = log q(d) at the slot,
+    # teacher = the cached scalar log p(d).
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    torch.manual_seed(1)
+    hidden, vocab, K = 4, 6, 3
+    draft_hidden = torch.randn(1, K, hidden)
+    out = torch.nn.Linear(hidden, vocab, bias=False)
+    long = lambda v: torch.tensor(v, dtype=torch.long)  # noqa: E731
+    student_t, teacher_t, mask_t = student._collect_rejected_draft_log_probs(
+        draft_hidden=draft_hidden,
+        output_embeddings=out,
+        prompt_lengths=long([2]),
+        response_lengths=long([4]),
+        anchor_positions=long([[2]]),
+        block_keep_mask=torch.tensor([[True]]),
+        draft_block_size=K,
+        lm_head_chunk_size=64,
+        max_tokens_per_sample=None,
+        rejected_draft_anchor_indices=long([[0]]),
+        rejected_draft_offsets=long([[1]]),
+        rejected_draft_token_ids=long([[3]]),
+        rejected_draft_teacher_logprobs=torch.tensor([[-0.7]]),
+        rejected_draft_mask=torch.tensor([[True]]),
+    )
+    assert mask_t.tolist() == [[True]]
+    expected_logq = F.log_softmax(out(draft_hidden[0, 1]).float(), -1)[3]  # log q at token 3, draft slot 1
+    assert torch.allclose(student_t[0, 0], expected_logq, atol=1e-6)
+    assert torch.allclose(teacher_t[0, 0], torch.tensor(-0.7), atol=1e-6)
 
 
 def _data_one_sample():

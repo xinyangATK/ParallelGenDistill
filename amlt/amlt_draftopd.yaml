@@ -60,9 +60,9 @@ env_defaults:
   REJECTED_DRAFT_REVERSE: True
   # ---- Top-K forward KL (in-model, from the frozen teacher's full logits). Default off = original
   #      draftopd. TOPK_FKL_RESPONSE=True -> response forward term is a top-K forward KL (request 1).
-  #      TOPK_FKL_REJECT=True -> reject stream is a top-K forward KL on the draft's full-block-depth
-  #      predictions (reject position & after) vs teacher realized top-K, instead of reverse KL on the
-  #      rejected token (request 2; keeps offset decay). TOPK_FKL_MODE=teacher|student|union. ----
+  #      TOPK_FKL_REJECT=True -> reject stream uses the SAME rollout-reject slots as baseline but a top-K
+  #      forward KL vs the teacher's realized-position top-K (teacher forcing), instead of reverse KL on
+  #      the rejected token's cached scalar (request 2; keeps offset decay). TOPK_FKL_MODE=teacher|student|union. ----
   TOPK_FKL_RESPONSE: False
   TOPK_FKL_REJECT: False
   TOPK_FKL_MODE: teacher
