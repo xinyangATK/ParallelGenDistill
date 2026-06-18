@@ -67,6 +67,11 @@ env_defaults:
   TOPK_FKL_REJECT: False
   TOPK_FKL_MODE: teacher
   TOPK_FKL_K: 64
+  # Reject-stream per-offset weighting: weight each rejected/FKL slot by DECAY^(offset-1) (offset = draft
+  # head depth). Applies to BOTH the baseline reverse stream and the Request 2 top-K FKL. ENABLED=False ->
+  # uniform weights. Matches the launcher defaults (True / 0.8); set here to make them tunable at submit.
+  REJECTED_DRAFT_POSITION_DECAY_ENABLED: True
+  REJECTED_DRAFT_POSITION_DECAY: 0.8
   train_epochs: 8
 
 target:
@@ -131,6 +136,8 @@ jobs:
       - export TOPK_FKL_REJECT=${TOPK_FKL_REJECT}
       - export TOPK_FKL_MODE=${TOPK_FKL_MODE}
       - export TOPK_FKL_K=${TOPK_FKL_K}
+      - export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED}
+      - export REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY}
       - export train_epochs=${train_epochs}
       - export EXP_NAME=$${AMLT_EXPERIMENT_NAME:-draftopd}
       # ---- OPD train pool: prebuilt and BUNDLED in the repo (data_prep/), uploaded with
