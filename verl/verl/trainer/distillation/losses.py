@@ -643,15 +643,26 @@ def distillation_loss(
             rejected_draft_mask=rejected_draft_mask,
             loss_config=loss_config,
         )
-        rejected_draft_losses, rejected_component_metrics = _combine_sampled_reverse_forward_losses(
-            student_log_probs=rejected_student_log_probs,
-            teacher_log_probs=rejected_teacher_log_probs,
-            loss_config=loss_config,
-            mask=rejected_draft_mask,
-            stream_name="rejected_draft",
-            force_reverse_kl=bool(getattr(loss_config, "rejected_draft_use_reverse_kl", False)),
-        )
-        distillation_metrics.update(rejected_component_metrics)
+        if getattr(loss_config, "topk_fkl_reject_enabled", False):
+            # draftopd request 2: the reject stream loss is the in-model top-K forward KL on the draft's
+            # full-block-depth predictions. SEMANTIC OVERLOAD: to avoid a new model-output key, the model
+            # carries the per-slot FKL in the rejected-draft "student_log_probs" channel (teacher channel
+            # stays 0) -- so rejected_student_log_probs here is the FKL loss, not log q(d). Use it directly;
+            # the rollout-reject reverse-KL combine is bypassed. Weights / offset decay apply as usual.
+            rejected_draft_losses = rejected_student_log_probs.to(dtype=distillation_losses.dtype)
+            distillation_metrics["distillation/rejected_draft_topk_fkl_loss"] = Metric(
+                AggregationType.MEAN, _valid_mean(rejected_draft_losses, rejected_draft_mask)
+            )
+        else:
+            rejected_draft_losses, rejected_component_metrics = _combine_sampled_reverse_forward_losses(
+                student_log_probs=rejected_student_log_probs,
+                teacher_log_probs=rejected_teacher_log_probs,
+                loss_config=loss_config,
+                mask=rejected_draft_mask,
+                stream_name="rejected_draft",
+                force_reverse_kl=bool(getattr(loss_config, "rejected_draft_use_reverse_kl", False)),
+            )
+            distillation_metrics.update(rejected_component_metrics)
         if loss_config.loss_max_clamp is not None:
             rejected_clamp_fraction = _compute_loss_clamp_fraction(
                 rejected_draft_losses, rejected_draft_mask, loss_config.loss_max_clamp
@@ -724,12 +735,10 @@ def distillation_loss(
             global_rejected_effective_count = global_batch_info.get(
                 "opd_rejected_draft_batch_effective_num_tokens"
             )
-            if loss_config.onpolicy_reverse_enabled:
-                # paradistill re-samples a fresh draft token per (block, offset) slot and
-                # computes the reverse loss on ALL of them (overlapping sampled-mode blocks are kept, not
-                # deduped). Each slot may be decayed by its offset (decay^(offset-1)). The engine's counts
-                # reflect the IGNORED rollout rejects, so all-reduce the actual local slot count and the
-                # local decay-weight sum instead (a no-op on CPU / single rank).
+            if loss_config.onpolicy_reverse_enabled or getattr(loss_config, "topk_fkl_reject_enabled", False):
+                # paradistill / draftopd reject top-K FKL build their own (block, offset) slots that do not
+                # match the engine's rollout-reject counts, so all-reduce the actual local slot count and
+                # the local decay-weight sum instead (a no-op on CPU / single rank).
                 global_rejected_count = _global_sum(rejected_count, dp_group)
                 global_rejected_effective_count = _global_sum(rejected_effective_count, dp_group)
             else:
@@ -920,12 +929,26 @@ def compute_distillation_loss_reverse_kl_estimator(
     - distillation_losses: (bsz, resp_len)
     - distillation_metrics: Dictionary of metrics.
     """
+    loss_config: DistillationLossConfig = distillation_config.distillation_loss
+    # draftopd request 1: the response forward term is a top-K forward KL computed in-model from the frozen
+    # teacher's full logits (student/teacher/union top-K). SEMANTIC OVERLOAD: to avoid a new model-output
+    # key (and a transformer_impl passthrough), the model writes the per-position FKL INTO the "log_probs"
+    # channel in place of the scalar log q(y_j) -- so here model_output["log_probs"] is the FKL loss, not a
+    # log-prob. Consume it directly; log q is unused in this config (forward-KL replaces the whole response
+    # loss; no reverse / no policy-gradient).
+    if getattr(loss_config, "topk_fkl_response_enabled", False):
+        distillation_losses = no_padding_2_padding(model_output["log_probs"], data)
+        response_mask_bool = get_effective_distillation_response_mask(data=data, model_output=model_output)
+        return distillation_losses, {
+            "distillation/response_topk_fkl_loss": Metric(
+                AggregationType.MEAN, _valid_mean(distillation_losses, response_mask_bool)
+            )
+        }
+
     student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
     teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
     response_mask_bool = get_effective_distillation_response_mask(data=data, model_output=model_output)
     assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
-
-    loss_config: DistillationLossConfig = distillation_config.distillation_loss
     # Per-position form (always on): response tokens at SD reject positions (corrected token y) use
     # forward-KL only -- the reverse-KL at a reject position is handled by the rejected-draft stream on
     # the rejected token d. Only meaningful when forward KL is active (otherwise there is nothing to

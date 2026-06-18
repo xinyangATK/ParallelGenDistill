@@ -37,6 +37,17 @@ REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED:-T
 REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY:-0.8}
 RANDOM_RESPONSE_ANCHOR_ENABLED=${RANDOM_RESPONSE_ANCHOR_ENABLED:-False}
 RANDOM_RESPONSE_ANCHOR_SEED=${RANDOM_RESPONSE_ANCHOR_SEED:-42}
+# draftopd top-K forward KL (computed in-model from the frozen teacher's full logits). Default off ->
+# original draftopd (scalar Bernoulli response forward + reverse KL on the rollout-rejected token).
+#   TOPK_FKL_RESPONSE=True  -> request 1: response forward term becomes a top-K forward KL.
+#   TOPK_FKL_REJECT=True    -> request 2: reject stream becomes a top-K forward KL on the draft's
+#                              full-block-depth predictions (reject position & after) vs teacher realized
+#                              top-K, instead of the reverse KL on the rejected token. Keeps offset decay.
+#   TOPK_FKL_MODE=teacher|student|union  (which top-K index set), TOPK_FKL_K=<int>.
+TOPK_FKL_RESPONSE=${TOPK_FKL_RESPONSE:-False}
+TOPK_FKL_REJECT=${TOPK_FKL_REJECT:-False}
+TOPK_FKL_MODE=${TOPK_FKL_MODE:-teacher}
+TOPK_FKL_K=${TOPK_FKL_K:-64}
 DFLASH_LM_HEAD_CHUNK_SIZE=${DFLASH_LM_HEAD_CHUNK_SIZE:-512}
 TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.2}
 ENABLE_THINKING=${ENABLE_THINKING:-False}
@@ -60,6 +71,12 @@ exec bash "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     ++actor_rollout_ref.model.override_config.verl_dflash_rejected_draft_reverse_enabled="${REJECTED_DRAFT_REVERSE}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_enabled="${RANDOM_RESPONSE_ANCHOR_ENABLED}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_seed="${RANDOM_RESPONSE_ANCHOR_SEED}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_response_enabled="${TOPK_FKL_RESPONSE}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_reject_enabled="${TOPK_FKL_REJECT}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_mode="${TOPK_FKL_MODE}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_k="${TOPK_FKL_K}" \
+    distillation.distillation_loss.topk_fkl_response_enabled="${TOPK_FKL_RESPONSE}" \
+    distillation.distillation_loss.topk_fkl_reject_enabled="${TOPK_FKL_REJECT}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_PROMPT_BSZ}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${STUDENT_MAX_TOKEN_LEN_PER_GPU}" \

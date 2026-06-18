@@ -58,6 +58,15 @@ env_defaults:
   # FORWARD-ONLY draftopd: skip the reverse stream in the model (no reverse softmax / OOM), train only
   # the response forward KL. Override at submit: REJECTED_DRAFT_REVERSE=False amlt run ... --yes
   REJECTED_DRAFT_REVERSE: True
+  # ---- Top-K forward KL (in-model, from the frozen teacher's full logits). Default off = original
+  #      draftopd. TOPK_FKL_RESPONSE=True -> response forward term is a top-K forward KL (request 1).
+  #      TOPK_FKL_REJECT=True -> reject stream is a top-K forward KL on the draft's full-block-depth
+  #      predictions (reject position & after) vs teacher realized top-K, instead of reverse KL on the
+  #      rejected token (request 2; keeps offset decay). TOPK_FKL_MODE=teacher|student|union. ----
+  TOPK_FKL_RESPONSE: False
+  TOPK_FKL_REJECT: False
+  TOPK_FKL_MODE: teacher
+  TOPK_FKL_K: 64
   train_epochs: 8
 
 target:
@@ -118,6 +127,10 @@ jobs:
       - export FORWARD_KL_WEIGHT=${FORWARD_KL_WEIGHT}
       - export REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT}
       - export REJECTED_DRAFT_REVERSE=${REJECTED_DRAFT_REVERSE}
+      - export TOPK_FKL_RESPONSE=${TOPK_FKL_RESPONSE}
+      - export TOPK_FKL_REJECT=${TOPK_FKL_REJECT}
+      - export TOPK_FKL_MODE=${TOPK_FKL_MODE}
+      - export TOPK_FKL_K=${TOPK_FKL_K}
       - export train_epochs=${train_epochs}
       - export EXP_NAME=$${AMLT_EXPERIMENT_NAME:-draftopd}
       # ---- OPD train pool: prebuilt and BUNDLED in the repo (data_prep/), uploaded with

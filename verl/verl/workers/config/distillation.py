@@ -92,6 +92,17 @@ class DistillationLossConfig(BaseConfig):
     # response stream (N_rejected == N_response), so it shares the response normalization basis instead of
     # the engine's rollout-reject count. Paired with verl_dflash_onpolicy_reverse_enabled on the model.
     onpolicy_reverse_enabled: bool = False
+    # draftopd top-K forward KL (computed in-model from the frozen teacher's full logits). When set, the
+    # response / rejected-draft loss is the model-computed per-slot top-K forward-KL instead of the scalar
+    # Bernoulli-forward / reverse-KL estimators. To avoid new model-output keys (and a transformer_impl
+    # passthrough) the FKL rides in EXISTING channels: the response FKL replaces model_output["log_probs"],
+    # and the reject FKL rides in model_output["opd_rejected_draft_student_log_probs"] (teacher channel
+    # unused) -- so those tensors hold the FKL loss, NOT log-probs, when the flags are on. Pair each with
+    # the matching verl_dflash_topk_fkl_* model override. reject_enabled reuses the rejected-draft stream
+    # (weight + optional offset decay) but counts the actual local slots (like onpolicy_reverse), not the
+    # engine's rollout-reject count.
+    topk_fkl_response_enabled: bool = False
+    topk_fkl_reject_enabled: bool = False
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 
