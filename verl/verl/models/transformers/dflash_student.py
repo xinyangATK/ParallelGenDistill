@@ -369,6 +369,17 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             value = os.getenv("VERL_DFLASH_ONPOLICY_REVERSE_ENABLED", "0")
         return str(value).lower() in {"1", "true", "yes", "on"}
 
+    def _get_rejected_draft_reverse_enabled(self) -> bool:
+        """draftopd (reject-mode) toggle for the rollout-reject reverse stream. Default True = original
+        draftopd (response forward-KL + reverse-KL on the rejected draft token d, decayed by offset).
+        Set False for a forward-only draftopd: skip _collect_rejected_draft_log_probs ENTIRELY in the
+        model (not just zero its loss weight, which still pays the full reverse LM-head softmax / OOMs).
+        No effect with free anchors (those already have no rollout-reject reverse)."""
+        value = getattr(self.config, "verl_dflash_rejected_draft_reverse_enabled", None)
+        if value is None:
+            value = os.getenv("VERL_DFLASH_REJECTED_DRAFT_REVERSE_ENABLED", "1")
+        return str(value).lower() in {"1", "true", "yes", "on"}
+
     def _get_draft_sample_temperature(self) -> float:
         """T_draft for drawing fresh on-policy samples y_hat_j ~ q. 1.0 gives genuine q-samples (an
         unbiased k3 reverse-KL estimate); other values trade bias for exploration."""
@@ -1199,9 +1210,10 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         # The rollout-reject reverse stream (_collect_rejected_draft_log_probs + its anchors) is intrinsic
         # to reject-mode anchors (draftopd). With free anchors (paradistill: stride_k/sampled) it has no
         # meaning, so when on-policy reverse is also off the model emits NO reverse stream -> response
-        # forward-KL only. This is what makes paradistill ONPOLICY_REVERSE=False a true forward-only run
-        # (no wasted reverse LM-head softmax / OOM), without any extra flag.
-        reject_reverse_enabled = response_anchor_mode == "reject"
+        # forward-KL only (this makes paradistill ONPOLICY_REVERSE=False a true forward-only run). In
+        # reject mode it can also be turned off explicitly (verl_dflash_rejected_draft_reverse_enabled=
+        # False) for a forward-only draftopd -- skipping the reverse compute, not just zeroing its loss.
+        reject_reverse_enabled = response_anchor_mode == "reject" and self._get_rejected_draft_reverse_enabled()
         anchor_positions, segment_lens, row_starts, block_keep_mask, valid_seq_lens, opd_metrics = (
             self._build_opd_anchor_plan(
                 input_ids=input_ids,

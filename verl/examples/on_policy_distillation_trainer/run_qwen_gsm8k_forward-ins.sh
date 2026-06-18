@@ -26,6 +26,13 @@ ROLLOUT_SPEED_TEST_MAX_SAMPLES_PER_BENCHMARK=${ROLLOUT_SPEED_TEST_MAX_SAMPLES_PE
 train_epochs=${train_epochs:-8}
 stream_weight=${stream_weight:-1.0}
 rejected_draft_stream_weight=${rejected_draft_stream_weight:-1.0}
+# REJECTED_DRAFT_REVERSE=True (default) = original draftopd (reverse KL on the rejected draft token).
+# =False -> FORWARD-ONLY draftopd: the model skips the reverse stream entirely (no reverse LM-head
+# softmax / OOM), trains only the response forward KL. Also zero its loss weight to keep metrics clean.
+REJECTED_DRAFT_REVERSE=${REJECTED_DRAFT_REVERSE:-True}
+case "${REJECTED_DRAFT_REVERSE,,}" in
+    false | 0 | no | off) rejected_draft_stream_weight=0.0 ;;
+esac
 REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED:-True}
 REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY:-0.8}
 RANDOM_RESPONSE_ANCHOR_ENABLED=${RANDOM_RESPONSE_ANCHOR_ENABLED:-False}
@@ -50,6 +57,7 @@ exec bash "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     +data.apply_chat_template_kwargs.enable_thinking="${ENABLE_THINKING}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_draft_model_path="${DRAFT_MODEL_PATH}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_lm_head_chunk_size="${DFLASH_LM_HEAD_CHUNK_SIZE}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_rejected_draft_reverse_enabled="${REJECTED_DRAFT_REVERSE}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_enabled="${RANDOM_RESPONSE_ANCHOR_ENABLED}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_seed="${RANDOM_RESPONSE_ANCHOR_SEED}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_PROMPT_BSZ}" \

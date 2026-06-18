@@ -54,6 +54,10 @@ env_defaults:
   DISTILLATION_LOSS_MODE: k3
   FORWARD_KL_WEIGHT: 1.0
   REVERSE_KL_WEIGHT: 0.0
+  # True (default) = original draftopd (reverse KL on the rejected draft token). Set False for a
+  # FORWARD-ONLY draftopd: skip the reverse stream in the model (no reverse softmax / OOM), train only
+  # the response forward KL. Override at submit: REJECTED_DRAFT_REVERSE=False amlt run ... --yes
+  REJECTED_DRAFT_REVERSE: True
   train_epochs: 8
 
 target:
@@ -113,6 +117,7 @@ jobs:
       - export DISTILLATION_LOSS_MODE=${DISTILLATION_LOSS_MODE}
       - export FORWARD_KL_WEIGHT=${FORWARD_KL_WEIGHT}
       - export REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT}
+      - export REJECTED_DRAFT_REVERSE=${REJECTED_DRAFT_REVERSE}
       - export train_epochs=${train_epochs}
       - export EXP_NAME=$${AMLT_EXPERIMENT_NAME:-draftopd}
       # ---- OPD train pool: prebuilt and BUNDLED in the repo (data_prep/), uploaded with
