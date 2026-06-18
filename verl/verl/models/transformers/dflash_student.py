@@ -1196,6 +1196,12 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 "with verl_dflash_random_response_anchor_enabled."
             )
         split_random_rejected_pass = random_response_anchor_enabled
+        # The rollout-reject reverse stream (_collect_rejected_draft_log_probs + its anchors) is intrinsic
+        # to reject-mode anchors (draftopd). With free anchors (paradistill: stride_k/sampled) it has no
+        # meaning, so when on-policy reverse is also off the model emits NO reverse stream -> response
+        # forward-KL only. This is what makes paradistill ONPOLICY_REVERSE=False a true forward-only run
+        # (no wasted reverse LM-head softmax / OOM), without any extra flag.
+        reject_reverse_enabled = response_anchor_mode == "reject"
         anchor_positions, segment_lens, row_starts, block_keep_mask, valid_seq_lens, opd_metrics = (
             self._build_opd_anchor_plan(
                 input_ids=input_ids,
@@ -1213,7 +1219,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 rejected_draft_anchor_indices=rejected_draft_anchor_indices,
                 rejected_draft_offsets=rejected_draft_offsets,
                 rejected_draft_mask=rejected_draft_mask,
-                include_rejected_draft_anchors=not split_random_rejected_pass,
+                include_rejected_draft_anchors=not split_random_rejected_pass and reject_reverse_enabled,
             )
         )
 
@@ -1394,7 +1400,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     rejected_loss_mask[response_batch_tensor, col] = True
                     rejected_offsets[response_batch_tensor, col] = onpolicy_flat_offsets.to(torch.long)
                     rejected_draft_offsets = rejected_offsets
-            elif not split_random_rejected_pass:
+            elif not split_random_rejected_pass and reject_reverse_enabled:
                 rejected_student_log_probs, rejected_teacher_log_probs, rejected_loss_mask = (
                     self._collect_rejected_draft_log_probs(
                         draft_hidden=draft_hidden,

@@ -49,6 +49,9 @@ case "${ONPOLICY_REVERSE,,}" in
         )
         ;;
     *)
+        # FORWARD-ONLY: on-policy reverse off + free (non-reject) anchors -> the model emits NO reverse
+        # stream at all (the rollout-reject reverse only runs in reject anchor mode), so no wasted
+        # reverse LM-head softmax. ANCHOR_MODE must be stride_k|sampled (paradistill default), not reject.
         REVERSE_OVERRIDES=(
             ++actor_rollout_ref.model.override_config.verl_dflash_onpolicy_reverse_enabled=False
             distillation.distillation_loss.onpolicy_reverse_enabled=False
