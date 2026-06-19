@@ -58,6 +58,11 @@ distillation_loss:
   # the response stream (paired with the model override verl_dflash_onpolicy_reverse_enabled).
   onpolicy_reverse_enabled: false
 
+  # draftopd top-K forward KL: response / reject loss becomes the model-computed top-K forward KL
+  # (paired with the verl_dflash_topk_fkl_* model overrides). See DistillationLossConfig for details.
+  topk_fkl_response_enabled: false
+  topk_fkl_reject_enabled: false
+
   # Optional max clamp value for distillation loss. If null, no clamping is applied.
   loss_max_clamp: null
 
