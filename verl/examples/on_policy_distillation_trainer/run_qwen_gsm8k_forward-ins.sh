@@ -24,6 +24,11 @@ ROLLOUT_AGENT_NUM_WORKERS=${ROLLOUT_AGENT_NUM_WORKERS:-$STUDENT_WORLD_SIZE}
 ROLLOUT_SPEED_TEST_WORKER_COUNT=${ROLLOUT_SPEED_TEST_WORKER_COUNT:-$STUDENT_WORLD_SIZE}
 ROLLOUT_SPEED_TEST_MAX_SAMPLES_PER_BENCHMARK=${ROLLOUT_SPEED_TEST_MAX_SAMPLES_PER_BENCHMARK:-$(( ROLLOUT_SPEED_TEST_WORKER_COUNT * 2 ))}
 train_epochs=${train_epochs:-8}
+# Resume from the latest checkpoint under default_local_dir if present (disable | auto | resume_path).
+# auto is safe on a fresh run (just starts from scratch when no checkpoint exists). The composed student
+# rebuilds the frozen main_model from HF and restores only the trainable draft + optim/sched/RNG. This
+# overrides run_qwen_gsm8k.sh's hardcoded trainer.resume_mode=disable (passed later in "$@").
+RESUME_MODE=${RESUME_MODE:-disable}
 stream_weight=${stream_weight:-1.0}
 rejected_draft_stream_weight=${rejected_draft_stream_weight:-1.0}
 # REJECTED_DRAFT_REVERSE=True (default) = original draftopd (reverse KL on the rejected draft token).
@@ -112,6 +117,7 @@ exec bash "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     trainer.rollout_speed_test_worker_count="${ROLLOUT_SPEED_TEST_WORKER_COUNT}" \
     trainer.rollout_speed_test_max_samples_per_benchmark="${ROLLOUT_SPEED_TEST_MAX_SAMPLES_PER_BENCHMARK}" \
     trainer.total_epochs="${train_epochs}" \
+    trainer.resume_mode="${RESUME_MODE}" \
     trainer.experiment_name="${EXP_NAME}" \
     trainer.default_local_dir="${CKPT_DIR}" \
     "$@"

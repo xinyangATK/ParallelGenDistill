@@ -54,6 +54,10 @@ env_defaults:
   DISTILLATION_LOSS_MODE: k3
   FORWARD_KL_WEIGHT: 1.0
   REVERSE_KL_WEIGHT: 0.0
+  # Auto-resume from the latest checkpoint on the blob (disable | auto | resume_path). Safe on a fresh
+  # run. Re-submitting the SAME experiment name continues from the last global_step_*; the frozen
+  # main_model is rebuilt from HF. Set RESUME_MODE=disable to force from-scratch.
+  RESUME_MODE: auto
   # True (default) = original draftopd (reverse KL on the rejected draft token). Set False for a
   # FORWARD-ONLY draftopd: skip the reverse stream in the model (no reverse softmax / OOM), train only
   # the response forward KL. Override at submit: REJECTED_DRAFT_REVERSE=False amlt run ... --yes
@@ -132,6 +136,7 @@ jobs:
       - export DISTILLATION_LOSS_MODE=${DISTILLATION_LOSS_MODE}
       - export FORWARD_KL_WEIGHT=${FORWARD_KL_WEIGHT}
       - export REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT}
+      - export RESUME_MODE=${RESUME_MODE}
       - export REJECTED_DRAFT_REVERSE=${REJECTED_DRAFT_REVERSE}
       - export TOPK_FKL_RESPONSE=${TOPK_FKL_RESPONSE}
       - export TOPK_FKL_REJECT=${TOPK_FKL_REJECT}

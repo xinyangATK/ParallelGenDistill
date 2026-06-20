@@ -1,0 +1,87 @@
+description: Standalone SGLang eval of a single (pretrained) DFLASH draft — no training checkpoints.
+# ---------------------------------------------------------------------------
+# Benchmarks ONE draft model directly on SGLang (DFLASH spec-decoding) — no global_step_* checkpoints
+# and no FSDP extraction. Use it to get a baseline number for a pretrained draft (e.g.
+# z-lab/Qwen3-4B-DFlash-b16) or any standalone draft dir on the blob. Runs
+# diffusion/dflash/eval_single_draft_sglang.sh, which generates a one-job config and runs it through
+# sglang_run_bench.sh (same image / server launch / report as amlt_eval.yaml).
+#
+# Usage:
+#   DRAFT_MODEL=z-lab/Qwen3-4B-DFlash-b16 amlt run amlt/amlt_eval_draft.yaml pretrain_eval --yes
+#   # a draft dir already on the blob (e.g. an extracted checkpoint):
+#   DRAFT_MODEL=/blob/.../global_step_5000/draft_model amlt run amlt/amlt_eval_draft.yaml ckpt5k --yes
+#   # custom datasets:
+#   DRAFT_MODEL=z-lab/Qwen3-4B-DFlash-b16 DATASETS_CSV="gsm8k:128,math500:128" \
+#     amlt run amlt/amlt_eval_draft.yaml pretrain_small --yes
+#
+# Report (.md + the generated config) lands under
+#   $AZURE_STORAGE_ROOT/outputs/draft_eval/<eval_exp>/  on the blob.
+# ---------------------------------------------------------------------------
+
+env_defaults:
+  SLA: Premium
+  NODES: 1
+  MEM: 80                       # A100-80G
+  GPUS: 1                       # single draft -> one job on one GPU
+  NVLINK_SUFFIX: ""             # "-NvLink" only matters for GPUS=8
+
+  # ---- What to eval ----
+  TARGET_MODEL: Qwen/Qwen3-4B
+  DRAFT_MODEL: z-lab/Qwen3-4B-DFlash-b16   # the pretrained DFLASH draft (HF id) or a blob path
+  DATASETS_CSV: "gsm8k:128,aime24:30,math500:128,mbpp:128,humaneval:164,mt-bench:80"
+
+target:
+  service: sing
+  name: GenAI-Shared-UKSouth2
+  workspace_name: Singularity-GenAI-WS-UKSouth2
+  resource_group: singularity-genai-gpu-uksouth2
+
+code:
+  local_dir: ./                 # upload the repo root (this yaml lives in amlt/); see .amltignore
+
+storage:
+  data:
+    storage_account_name: vigstandard
+    container_name: data
+    mount_dir: /blob
+    is_output: true             # persist reports + HF caches back to the blob
+
+environment:
+  image: draft-opd/draft-opd:latest   # same image as training/eval (sglang stack + libnuma).
+  username: 44359f3e6e864ddba0853a221be97722
+  registry: 44359f3e6e864ddba0853a221be97722.azurecr.io
+  env:
+    AMLT_DOCKERFILE_TEMPLATE: none
+
+jobs:
+  - name: draftopd_eval_single
+    sku: ${NODES}x${MEM}G${GPUS}${NVLINK_SUFFIX}
+    sla_tier: ${SLA}
+    priority: high
+    mpi: False
+    process_count_per_node: 1
+    command:
+      - cd $$AMLT_CODE_DIR
+      # ---- HF env: blob caches; allow online so datasets/models can be fetched (reused after). The
+      #      inner sglang_run_bench.sh uses ${HF_HOME:-...} defaults, so these pre-exports win. ----
+      - export AZURE_STORAGE_ROOT=$${AZURE_STORAGE_ROOT:-/blob/t-xinyangliu}
+      - export HF_HOME=$${HF_HOME:-$${AZURE_STORAGE_ROOT}/cache/hf}
+      - export HF_HUB_OFFLINE=0
+      - export HF_DATASETS_OFFLINE=0
+      # ---- What to eval ----
+      - export TARGET_MODEL="${TARGET_MODEL}"
+      - export DRAFT_MODEL="${DRAFT_MODEL}"
+      - export DATASETS_CSV="${DATASETS_CSV}"
+      # ---- Report dir on the blob, suffixed by the eval experiment name ----
+      - export EVAL_LOG_DIR=$${AZURE_STORAGE_ROOT}/outputs/draft_eval/$${AMLT_EXPERIMENT_NAME}
+      # ---- Pre-cache models (best-effort; sglang downloads on demand otherwise) ----
+      - hf download "${DRAFT_MODEL}" >/dev/null 2>&1 || true
+      - hf download "${TARGET_MODEL}" >/dev/null 2>&1 || true
+      # ---- Step 1: download the eval datasets into the blob HF cache (idempotent; reused after) ----
+      - bash diffusion/dflash/prepare_eval_data.sh
+      # ---- Step 2: bench the single draft ----
+      - bash diffusion/dflash/eval_single_draft_sglang.sh
+    submit_args:
+      env:
+        DATASET_MOUNT_BLOCK_BASED_CACHE_ENABLED: True
+        SHARED_MEMORY_PERCENT: 0.5
