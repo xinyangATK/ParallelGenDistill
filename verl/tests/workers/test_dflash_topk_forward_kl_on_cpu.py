@@ -34,7 +34,8 @@ def _make_inputs(seed: int = 0):
     return draft_hidden, teacher_logits, output_embeddings, batch_indices, draft_indices, row_indices, token_ids
 
 
-def _manual_topk_fkl(draft_hidden, teacher_logits, out, b, d, r, mode, k):
+def _manual_topk_fkl(draft_hidden, teacher_logits, out, b, d, r, mode, k, k_student=None):
+    k_student = k if k_student is None else k_student
     s_logits = out(draft_hidden[b, d, :]).float()
     s_lp = F.log_softmax(s_logits, dim=-1)
     t_logits = teacher_logits[b, r, :].float()
@@ -44,12 +45,12 @@ def _manual_topk_fkl(draft_hidden, teacher_logits, out, b, d, r, mode, k):
     if mode in ("teacher", "union"):
         sel.scatter_(-1, t_logits.topk(k, dim=-1).indices, True)
     if mode in ("student", "union"):
-        sel.scatter_(-1, s_logits.topk(k, dim=-1).indices, True)
+        sel.scatter_(-1, s_logits.topk(k_student, dim=-1).indices, True)
     return (t_p * (t_lp - s_lp) * sel).sum(dim=-1).clamp_min(0.0)
 
 
-def _call(student, draft_hidden, teacher_logits, out, b, d, r, *, mode, k=2, chunk_size=64,
-          calculate_entropy=False):
+def _call(student, draft_hidden, teacher_logits, out, b, d, r, *, mode, k=2, k_student=None,
+          chunk_size=64, calculate_entropy=False):
     return student._compute_topk_forward_kl(
         draft_hidden=draft_hidden,
         output_embeddings=out,
@@ -59,7 +60,8 @@ def _call(student, draft_hidden, teacher_logits, out, b, d, r, *, mode, k=2, chu
         row_indices=r,
         chunk_size=chunk_size,
         mode=mode,
-        topk=k,
+        topk_teacher=k,
+        topk_student=k if k_student is None else k_student,
         calculate_entropy=calculate_entropy,
     )
 
@@ -82,6 +84,16 @@ def test_topk_forward_kl_union_dedups_overlapping_indices():
     union, _ = _call(student, draft_hidden, teacher_logits, out, b, d, r, mode="union", k=3)
     manual = _manual_topk_fkl(draft_hidden, teacher_logits, out, b, d, r, "union", k=3)
     assert torch.allclose(union, manual, atol=1e-6)
+
+
+def test_topk_forward_kl_asymmetric_union_k():
+    # union with DIFFERENT teacher and student top-K (verl_dflash_topk_fkl_student_k): the support set is
+    # teacher-top-k_teacher U student-top-k_student; the partial-support sum must match the manual one.
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    draft_hidden, teacher_logits, out, b, d, r, _ = _make_inputs(seed=5)
+    fkl, _ = _call(student, draft_hidden, teacher_logits, out, b, d, r, mode="union", k=4, k_student=2, chunk_size=2)
+    expected = _manual_topk_fkl(draft_hidden, teacher_logits, out, b, d, r, "union", k=4, k_student=2)
+    assert torch.allclose(fkl, expected, atol=1e-6)
 
 
 def test_topk_forward_kl_grad_flows_through_student_only():

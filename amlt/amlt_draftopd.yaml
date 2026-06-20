@@ -66,7 +66,8 @@ env_defaults:
   TOPK_FKL_RESPONSE: False
   TOPK_FKL_REJECT: False
   TOPK_FKL_MODE: teacher
-  TOPK_FKL_K: 64
+  TOPK_FKL_K: 64                # teacher-side top-K
+  TOPK_FKL_STUDENT_K: 0         # student-side top-K for union/student; 0 = reuse TOPK_FKL_K (symmetric)
   # Reject-stream per-offset weighting: weight each rejected/FKL slot by DECAY^(offset-1) (offset = draft
   # head depth). Applies to BOTH the baseline reverse stream and the Request 2 top-K FKL. ENABLED=False ->
   # uniform weights. Matches the launcher defaults (True / 0.8); set here to make them tunable at submit.
@@ -136,6 +137,7 @@ jobs:
       - export TOPK_FKL_REJECT=${TOPK_FKL_REJECT}
       - export TOPK_FKL_MODE=${TOPK_FKL_MODE}
       - export TOPK_FKL_K=${TOPK_FKL_K}
+      - export TOPK_FKL_STUDENT_K=${TOPK_FKL_STUDENT_K}
       - export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED}
       - export REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY}
       - export train_epochs=${train_epochs}

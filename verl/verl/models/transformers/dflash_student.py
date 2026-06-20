@@ -433,6 +433,18 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             raise ValueError(f"verl_dflash_topk_fkl_k must be positive, got {value}.")
         return value
 
+    def _get_topk_fkl_student_k(self) -> int:
+        """Student-side top-K for the union/student forward KL (the teacher side uses
+        verl_dflash_topk_fkl_k). 0 (default) -> reuse the teacher K, i.e. same K for both
+        (original behavior). Set a different value for an asymmetric union support set."""
+        value = getattr(self.config, "verl_dflash_topk_fkl_student_k", None)
+        if value is None:
+            value = os.getenv("VERL_DFLASH_TOPK_FKL_STUDENT_K", "0")
+        value = int(value)
+        if value < 0:
+            raise ValueError(f"verl_dflash_topk_fkl_student_k must be >= 0 (0 reuses teacher K), got {value}.")
+        return value
+
     def _get_rejected_draft_max_tokens_per_sample(self) -> Optional[int]:
         value = getattr(self.config, "verl_dflash_rejected_draft_max_tokens_per_sample", None)
         if value is None:
@@ -614,13 +626,15 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         row_indices: torch.LongTensor,
         chunk_size: int,
         mode: str,
-        topk: int,
+        topk_teacher: int,
+        topk_student: int,
         calculate_entropy: bool = False,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Per-slot top-K forward KL ``sum_{v in S} p_t(v) (log p_t(v) - log q_s(v))``.
 
-        ``S`` = the teacher and/or student top-``topk`` token sets (``mode``). Teacher = frozen realized-prefix
-        logits at ``row_indices`` (no grad); student = draft head projection at ``(batch_indices, draft_indices)``
+        ``S`` = the teacher top-``topk_teacher`` and/or student top-``topk_student`` token sets (``mode``);
+        ``union`` takes both (the two K may differ). Teacher = frozen realized-prefix logits at
+        ``row_indices`` (no grad); student = draft head projection at ``(batch_indices, draft_indices)``
         (grad through ``log q_s`` only). The partial-support sum is clamped to >=0 (top-K mass < 1).
         """
         if batch_indices.numel() == 0:
@@ -630,7 +644,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         selected_hidden = draft_hidden[batch_indices, draft_indices, :]
         fkl_chunks: list[torch.Tensor] = []
         entropy_chunks: list[torch.Tensor] = []
-        topk = min(int(topk), int(teacher_logits.shape[-1]))
+        vocab_size = int(teacher_logits.shape[-1])
+        topk_teacher = min(int(topk_teacher), vocab_size)
+        topk_student = min(int(topk_student), vocab_size)
         for start in range(0, selected_hidden.shape[0], chunk_size):
             end = min(start + chunk_size, selected_hidden.shape[0])
             student_logits = output_embeddings(selected_hidden[start:end]).float()
@@ -641,9 +657,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 teacher_probs = teacher_log_probs.exp()
                 selection = torch.zeros_like(teacher_log_probs, dtype=torch.bool)
                 if mode in ("teacher", "union"):
-                    selection.scatter_(-1, teacher_chunk_logits.topk(topk, dim=-1).indices, True)
+                    selection.scatter_(-1, teacher_chunk_logits.topk(topk_teacher, dim=-1).indices, True)
                 if mode in ("student", "union"):
-                    selection.scatter_(-1, student_logits.detach().topk(topk, dim=-1).indices, True)
+                    selection.scatter_(-1, student_logits.detach().topk(topk_student, dim=-1).indices, True)
             fkl = (teacher_probs * (teacher_log_probs - student_log_probs) * selection.to(teacher_probs.dtype)).sum(
                 dim=-1
             ).clamp_min(0.0)
@@ -1024,6 +1040,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         teacher_logits: Optional[torch.Tensor] = None,
         topk_fkl_mode: str = "teacher",
         topk_fkl_k: int = 0,
+        topk_fkl_student_k: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per rollout-rejected-draft slot, return (student, teacher, mask) in (batch, rejected_width).
 
@@ -1120,7 +1137,8 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     row_indices=torch.tensor(selected_teacher_rows, dtype=torch.long, device=draft_hidden.device),
                     chunk_size=lm_head_chunk_size,
                     mode=topk_fkl_mode,
-                    topk=topk_fkl_k,
+                    topk_teacher=topk_fkl_k,
+                    topk_student=topk_fkl_student_k,
                 )
             else:
                 selected_values, _ = self._compute_selected_lm_log_probs(
@@ -1346,6 +1364,10 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             )
         topk_fkl_mode = self._get_topk_fkl_mode() if topk_fkl_enabled else "teacher"
         topk_fkl_k = self._get_topk_fkl_k() if topk_fkl_enabled else 0
+        # Student-side K for student/union support; 0 -> reuse the teacher K (symmetric, original behavior).
+        topk_fkl_student_k = self._get_topk_fkl_student_k() if topk_fkl_enabled else 0
+        if topk_fkl_student_k <= 0:
+            topk_fkl_student_k = topk_fkl_k
         split_random_rejected_pass = random_response_anchor_enabled
         # The rollout-reject reverse stream (_collect_rejected_draft_log_probs + its anchors) is intrinsic
         # to reject-mode anchors (draftopd). With free anchors (paradistill: stride_k/sampled) it has no
@@ -1538,7 +1560,8 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                         row_indices=response_row_tensor,
                         chunk_size=lm_head_chunk_size,
                         mode=topk_fkl_mode,
-                        topk=topk_fkl_k,
+                        topk_teacher=topk_fkl_k,
+                        topk_student=topk_fkl_student_k,
                         calculate_entropy=calculate_entropy,
                     )
                 else:
@@ -1599,6 +1622,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                         teacher_logits=teacher_logits,
                         topk_fkl_mode=topk_fkl_mode,
                         topk_fkl_k=topk_fkl_k,
+                        topk_fkl_student_k=topk_fkl_student_k,
                     )
                 )
             elif not split_random_rejected_pass and reject_reverse_enabled:

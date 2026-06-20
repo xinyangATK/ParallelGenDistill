@@ -49,6 +49,9 @@ TOPK_FKL_RESPONSE=${TOPK_FKL_RESPONSE:-False}
 TOPK_FKL_REJECT=${TOPK_FKL_REJECT:-False}
 TOPK_FKL_MODE=${TOPK_FKL_MODE:-teacher}
 TOPK_FKL_K=${TOPK_FKL_K:-64}
+# Student-side top-K for union/student support. 0 = reuse TOPK_FKL_K (same K for teacher & student).
+# Set != TOPK_FKL_K for an asymmetric union, e.g. TOPK_FKL_MODE=union TOPK_FKL_K=64 TOPK_FKL_STUDENT_K=8.
+TOPK_FKL_STUDENT_K=${TOPK_FKL_STUDENT_K:-0}
 DFLASH_LM_HEAD_CHUNK_SIZE=${DFLASH_LM_HEAD_CHUNK_SIZE:-512}
 TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.2}
 ENABLE_THINKING=${ENABLE_THINKING:-False}
@@ -76,6 +79,7 @@ exec bash "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_reject_enabled="${TOPK_FKL_REJECT}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_mode="${TOPK_FKL_MODE}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_k="${TOPK_FKL_K}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_student_k="${TOPK_FKL_STUDENT_K}" \
     distillation.distillation_loss.topk_fkl_response_enabled="${TOPK_FKL_RESPONSE}" \
     distillation.distillation_loss.topk_fkl_reject_enabled="${TOPK_FKL_REJECT}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_PROMPT_BSZ}" \
