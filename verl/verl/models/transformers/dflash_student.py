@@ -636,6 +636,13 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         ``union`` takes both (the two K may differ). Teacher = frozen realized-prefix logits at
         ``row_indices`` (no grad); student = draft head projection at ``(batch_indices, draft_indices)``
         (grad through ``log q_s`` only). The partial-support sum is clamped to >=0 (top-K mass < 1).
+
+        Implemented by GATHERING only the candidate indices (the union of the teacher/student top-K) --
+        no full-vocab teacher log-probs / probs / boolean mask / product are materialized (only the
+        unavoidable full student log-softmax, kept for the gradient). ``union`` is deduplicated via
+        ``keep`` (student columns whose token is already in the teacher top-K are zeroed), so each token
+        in S contributes exactly once -- numerically and gradient-equivalent to the masked full-vocab
+        form (the sole difference is float reduction order over |S| terms vs the full vocabulary).
         """
         if batch_indices.numel() == 0:
             empty = draft_hidden.new_empty((0,), dtype=torch.float32)
@@ -650,19 +657,33 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         for start in range(0, selected_hidden.shape[0], chunk_size):
             end = min(start + chunk_size, selected_hidden.shape[0])
             student_logits = output_embeddings(selected_hidden[start:end]).float()
-            student_log_probs = F.log_softmax(student_logits, dim=-1)
+            student_log_probs = F.log_softmax(student_logits, dim=-1)  # full vocab: needed for the gather + grad
             with torch.no_grad():
                 teacher_chunk_logits = teacher_logits[batch_indices[start:end], row_indices[start:end], :].float()
-                teacher_log_probs = F.log_softmax(teacher_chunk_logits, dim=-1)
-                teacher_probs = teacher_log_probs.exp()
-                selection = torch.zeros_like(teacher_log_probs, dtype=torch.bool)
+                teacher_lse = torch.logsumexp(teacher_chunk_logits, dim=-1, keepdim=True)  # (n, 1)
+                # Candidate support S = (teacher top-K) U (student top-K) by mode, gathered -- not masked.
+                index_parts: list[torch.Tensor] = []
+                keep_parts: list[torch.Tensor] = []
+                teacher_idx = None
                 if mode in ("teacher", "union"):
-                    selection.scatter_(-1, teacher_chunk_logits.topk(topk_teacher, dim=-1).indices, True)
+                    teacher_idx = teacher_chunk_logits.topk(topk_teacher, dim=-1).indices  # (n, K_t)
+                    index_parts.append(teacher_idx)
+                    keep_parts.append(torch.ones_like(teacher_idx, dtype=torch.bool))
                 if mode in ("student", "union"):
-                    selection.scatter_(-1, student_logits.detach().topk(topk_student, dim=-1).indices, True)
-            fkl = (teacher_probs * (teacher_log_probs - student_log_probs) * selection.to(teacher_probs.dtype)).sum(
-                dim=-1
-            ).clamp_min(0.0)
+                    student_idx = student_logits.detach().topk(topk_student, dim=-1).indices  # (n, K_s)
+                    index_parts.append(student_idx)
+                    if teacher_idx is None:
+                        keep_parts.append(torch.ones_like(student_idx, dtype=torch.bool))
+                    else:
+                        # union dedup: drop student columns whose token is already in the teacher top-K.
+                        dup = (student_idx.unsqueeze(-1) == teacher_idx.unsqueeze(-2)).any(dim=-1)  # (n, K_s)
+                        keep_parts.append(~dup)
+                cand_idx = torch.cat(index_parts, dim=-1)  # (n, |S_cand|)
+                keep = torch.cat(keep_parts, dim=-1).to(teacher_chunk_logits.dtype)  # (n, |S_cand|)
+                teacher_logp_sel = teacher_chunk_logits.gather(-1, cand_idx) - teacher_lse  # log p_t over S
+                teacher_probs_sel = teacher_logp_sel.exp()
+            student_logp_sel = student_log_probs.gather(-1, cand_idx)  # log q_s over S (keeps grad)
+            fkl = (teacher_probs_sel * (teacher_logp_sel - student_logp_sel) * keep).sum(dim=-1).clamp_min(0.0)
             fkl_chunks.append(fkl)
             if calculate_entropy:
                 entropy_chunks.append(-(student_log_probs.exp() * student_log_probs).sum(dim=-1))
