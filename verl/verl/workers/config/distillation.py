@@ -101,6 +101,11 @@ class DistillationLossConfig(BaseConfig):
     # the matching verl_dflash_topk_fkl_* model override.
     topk_fkl_response_enabled: bool = False
     topk_fkl_reject_enabled: bool = False
+    # draftopd ablation: keep ONLY the response Bernoulli forward-KL at SD reject positions (the corrected
+    # token y), dropping the loss on all accepted positions AND the rejected-draft reverse stream. The loss
+    # becomes the mean Bernoulli forward-KL over corrected tokens only. Pair with the model skipping the
+    # reject reverse compute (verl_dflash_rejected_draft_reverse_enabled=False) so no reverse softmax is run.
+    corrected_token_only: bool = False
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 

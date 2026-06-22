@@ -579,6 +579,16 @@ def distillation_loss(
     assert distillation_config is not None
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
     rejected_draft_stream = get_rejected_draft_distillation_stream(model_output)
+    corrected_token_only = bool(getattr(loss_config, "corrected_token_only", False))
+    if corrected_token_only:
+        if loss_config.use_policy_gradient:
+            raise NotImplementedError(
+                "corrected_token_only is a supervised forward-KL ablation; set use_policy_gradient=False."
+            )
+        # Keep ONLY the response Bernoulli forward-KL at corrected (SD reject) positions: drop the
+        # rejected-draft reverse stream entirely (the model should also skip its compute via
+        # verl_dflash_rejected_draft_reverse_enabled=False so no reverse softmax is run).
+        rejected_draft_stream = None
     if rejected_draft_stream is not None and loss_config.loss_mode == "forward_kl_topk":
         raise NotImplementedError("DFLASH rejected draft token training is not supported with forward_kl_topk.")
     if rejected_draft_stream is not None and loss_config.use_policy_gradient:
@@ -594,6 +604,14 @@ def distillation_loss(
     )
     response_mask = _padded_response_mask(data["response_mask"])
     effective_response_mask = get_effective_distillation_response_mask(data=data, model_output=model_output)
+    if corrected_token_only:
+        # Restrict the trained positions to SD reject positions (the corrected token y). These are the
+        # last token of each accepted run, already scored by the response stream -- so this is a pure mask.
+        corrected_mask = _build_corrected_token_mask(data, effective_response_mask)
+        effective_response_mask = effective_response_mask & corrected_mask
+        distillation_metrics["distillation/corrected_token_count"] = Metric(
+            AggregationType.SUM, effective_response_mask.sum().to(torch.float32)
+        )
     loss_agg_mode = config.loss_agg_mode
 
     distillation_metrics.update(
@@ -679,7 +697,9 @@ def distillation_loss(
             AggregationType.MEAN, rejected_valid_losses.mean()
         )
 
-    if not bool(effective_response_mask.any()) and rejected_draft_losses is None:
+    if not bool(effective_response_mask.any()) and rejected_draft_losses is None and not corrected_token_only:
+        # corrected_token_only is excluded here so it always reaches its branch below, where _global_sum is
+        # called on every rank -- returning early on an empty microbatch would diverge the dp collective.
         if "log_probs" in model_output:
             zero_loss = no_padding_2_padding(model_output["log_probs"], data).sum() * 0.0
         else:
@@ -709,7 +729,25 @@ def distillation_loss(
         distillation_metrics.update(pg_metrics)
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
-        if rejected_draft_losses is None:
+        if corrected_token_only:
+            # Mean Bernoulli forward-KL over corrected (SD reject) tokens only. Normalize by the GLOBAL
+            # corrected-token count (all-reduced on EVERY corrected_token_only rank -- the early-return above
+            # is disabled for this mode -- so the dp collective never diverges). dp_size cancels FSDP's
+            # gradient mean, giving a true global mean over corrected tokens.
+            global_batch_info = getattr(config, "global_batch_info", {}) or {}
+            dp_size = global_batch_info.get("dp_size", 1)
+            corrected_sum = (distillation_losses * effective_response_mask).sum()
+            global_corrected_count = _global_sum(
+                effective_response_mask.sum().to(distillation_losses.dtype), dp_group
+            )
+            if global_corrected_count.item() <= 0:
+                if "log_probs" in model_output:
+                    distillation_loss = no_padding_2_padding(model_output["log_probs"], data).sum() * 0.0
+                else:
+                    distillation_loss = distillation_losses.sum() * 0.0
+            else:
+                distillation_loss = corrected_sum / global_corrected_count * dp_size
+        elif rejected_draft_losses is None:
             distillation_loss = agg_loss(
                 loss_mat=distillation_losses,
                 loss_mask=effective_response_mask,

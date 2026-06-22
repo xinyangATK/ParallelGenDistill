@@ -62,6 +62,10 @@ env_defaults:
   # FORWARD-ONLY draftopd: skip the reverse stream in the model (no reverse softmax / OOM), train only
   # the response forward KL. Override at submit: REJECTED_DRAFT_REVERSE=False amlt run ... --yes
   REJECTED_DRAFT_REVERSE: True
+  # CORRECTED_TOKEN_ONLY=True -> ablation: loss = mean Bernoulli forward KL ONLY on the corrected token at
+  # each SD reject position (drops accepted-position response loss AND the rejected-draft reverse stream;
+  # forces the model to skip the reverse compute). Override at submit: CORRECTED_TOKEN_ONLY=True amlt run ...
+  CORRECTED_TOKEN_ONLY: False
   # ---- Top-K forward KL (in-model, from the frozen teacher's full logits). Default off = original
   #      draftopd. TOPK_FKL_RESPONSE=True -> response forward term is a top-K forward KL (request 1).
   #      TOPK_FKL_REJECT=True -> reject stream uses the SAME rollout-reject slots as baseline but a top-K
@@ -138,6 +142,7 @@ jobs:
       - export REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT}
       - export RESUME_MODE=${RESUME_MODE}
       - export REJECTED_DRAFT_REVERSE=${REJECTED_DRAFT_REVERSE}
+      - export CORRECTED_TOKEN_ONLY=${CORRECTED_TOKEN_ONLY}
       - export TOPK_FKL_RESPONSE=${TOPK_FKL_RESPONSE}
       - export TOPK_FKL_REJECT=${TOPK_FKL_REJECT}
       - export TOPK_FKL_MODE=${TOPK_FKL_MODE}

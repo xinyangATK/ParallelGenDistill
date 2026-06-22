@@ -38,6 +38,18 @@ REJECTED_DRAFT_REVERSE=${REJECTED_DRAFT_REVERSE:-True}
 case "${REJECTED_DRAFT_REVERSE,,}" in
     false | 0 | no | off) rejected_draft_stream_weight=0.0 ;;
 esac
+# CORRECTED_TOKEN_ONLY=True -> draftopd ablation: the loss is the mean Bernoulli forward KL computed ONLY on
+# the corrected token at each SD reject position. Drops the accepted-position response loss AND the
+# rejected-draft reverse stream entirely (forces the model to skip the reverse compute, like
+# REJECTED_DRAFT_REVERSE=False -> no reverse LM-head softmax / OOM). Keep the response forward-only
+# (REVERSE_KL_WEIGHT=0, FORWARD_KL_WEIGHT=1, the defaults above).
+CORRECTED_TOKEN_ONLY=${CORRECTED_TOKEN_ONLY:-False}
+case "${CORRECTED_TOKEN_ONLY,,}" in
+    true | 1 | yes | on)
+        REJECTED_DRAFT_REVERSE=False
+        rejected_draft_stream_weight=0.0
+        ;;
+esac
 REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED:-True}
 REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY:-0.8}
 RANDOM_RESPONSE_ANCHOR_ENABLED=${RANDOM_RESPONSE_ANCHOR_ENABLED:-False}
@@ -87,6 +99,7 @@ exec bash "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_student_k="${TOPK_FKL_STUDENT_K}" \
     distillation.distillation_loss.topk_fkl_response_enabled="${TOPK_FKL_RESPONSE}" \
     distillation.distillation_loss.topk_fkl_reject_enabled="${TOPK_FKL_REJECT}" \
+    distillation.distillation_loss.corrected_token_only="${CORRECTED_TOKEN_ONLY}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_PROMPT_BSZ}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${STUDENT_MAX_TOKEN_LEN_PER_GPU}" \
