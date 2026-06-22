@@ -63,6 +63,11 @@ distillation_loss:
   topk_fkl_response_enabled: false
   topk_fkl_reject_enabled: false
 
+  # draftopd ablation: keep ONLY the response Bernoulli forward-KL at SD reject positions (the corrected
+  # token y), dropping the accepted-position response loss AND the rejected-draft reverse stream. Pair with
+  # the model skipping the reverse compute (verl_dflash_rejected_draft_reverse_enabled=false).
+  corrected_token_only: false
+
   # Optional max clamp value for distillation loss. If null, no clamping is applied.
   loss_max_clamp: null
 
