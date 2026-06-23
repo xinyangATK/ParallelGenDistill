@@ -408,7 +408,7 @@ def test_rejected_draft_logits_are_selected_from_anchor_and_offset():
     with torch.no_grad():
         output_embeddings.weight.copy_(torch.eye(10))
 
-    student_log_probs, teacher_log_probs, mask = student._collect_rejected_draft_log_probs(
+    student_log_probs, teacher_log_probs, mask, _ = student._collect_rejected_draft_log_probs(
         draft_hidden=draft_hidden,
         output_embeddings=output_embeddings,
         prompt_lengths=torch.tensor([2]),
@@ -435,7 +435,7 @@ def test_empty_rejected_draft_metadata_returns_empty_stream():
     student = object.__new__(ComposedDFlashStudentForCausalLM)
     output_embeddings = torch.nn.Linear(10, 10, bias=False)
 
-    student_log_probs, teacher_log_probs, mask = student._collect_rejected_draft_log_probs(
+    student_log_probs, teacher_log_probs, mask, _ = student._collect_rejected_draft_log_probs(
         draft_hidden=torch.zeros(1, 4, 10, dtype=torch.float32),
         output_embeddings=output_embeddings,
         prompt_lengths=torch.tensor([2]),
@@ -466,7 +466,7 @@ def test_rejected_draft_max_tokens_per_sample_limits_loss_tokens():
     with torch.no_grad():
         output_embeddings.weight.copy_(torch.eye(10))
 
-    student_log_probs, _, mask = student._collect_rejected_draft_log_probs(
+    student_log_probs, _, mask, _ = student._collect_rejected_draft_log_probs(
         draft_hidden=draft_hidden,
         output_embeddings=output_embeddings,
         prompt_lengths=torch.tensor([2]),

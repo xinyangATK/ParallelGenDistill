@@ -58,15 +58,15 @@ distillation_loss:
   # the response stream (paired with the model override verl_dflash_onpolicy_reverse_enabled).
   onpolicy_reverse_enabled: false
 
-  # draftopd top-K forward KL: response / reject loss becomes the model-computed top-K forward KL
-  # (paired with the verl_dflash_topk_fkl_* model overrides). See DistillationLossConfig for details.
-  topk_fkl_response_enabled: false
-  topk_fkl_reject_enabled: false
-
-  # draftopd ablation: keep ONLY the response Bernoulli forward-KL at SD reject positions (the corrected
-  # token y), dropping the accepted-position response loss AND the rejected-draft reverse stream. Pair with
-  # the model skipping the reverse compute (verl_dflash_rejected_draft_reverse_enabled=false).
-  corrected_token_only: false
+  # draftopd per-region loss selection (paired with the verl_dflash_*_loss_mode model overrides).
+  # Forward regions: bernoulli_fkl | topk_fkl. Reject regions: reverse_kl | topk_fkl. Top-K is the in-model
+  # forward KL over teacher/student top-K (both K > 0 -> union). Defaults reproduce original draftopd.
+  response_loss_mode: bernoulli_fkl
+  reject_accept_loss_mode: bernoulli_fkl
+  reject_token_loss_mode: reverse_kl
+  post_reject_loss_mode: reverse_kl
+  topk_fkl_teacher_k: 64
+  topk_fkl_student_k: 0
 
   # Optional max clamp value for distillation loss. If null, no clamping is applied.
   loss_max_clamp: null

@@ -92,20 +92,20 @@ class DistillationLossConfig(BaseConfig):
     # response stream (N_rejected == N_response), so it shares the response normalization basis instead of
     # the engine's rollout-reject count. Paired with verl_dflash_onpolicy_reverse_enabled on the model.
     onpolicy_reverse_enabled: bool = False
-    # draftopd in-model top-K forward KL (from the teacher's full logits), default off. response/reject
-    # loss becomes the model-computed top-K FKL instead of the scalar Bernoulli-forward / reverse-KL.
-    # SEMANTIC OVERLOAD: to avoid new model-output keys the FKL rides in existing channels -- the response
-    # FKL replaces model_output["log_probs"] and the reject FKL rides in opd_rejected_draft_student_log_probs
-    # -- so those hold the FKL loss, not log-probs, when on. reject_enabled keeps draftopd's reject geometry
-    # (same rollout-reject slots/anchors/offsets; decay unchanged) and only swaps the loss. Pair each with
-    # the matching verl_dflash_topk_fkl_* model override.
-    topk_fkl_response_enabled: bool = False
-    topk_fkl_reject_enabled: bool = False
-    # draftopd ablation: keep ONLY the response Bernoulli forward-KL at SD reject positions (the corrected
-    # token y), dropping the loss on all accepted positions AND the rejected-draft reverse stream. The loss
-    # becomes the mean Bernoulli forward-KL over corrected tokens only. Pair with the model skipping the
-    # reject reverse compute (verl_dflash_rejected_draft_reverse_enabled=False) so no reverse softmax is run.
-    corrected_token_only: bool = False
+    # draftopd per-region loss selection. The response stream splits into the response (accepted) and
+    # reject-accept (corrected token y at SD reject positions) regions; the reject stream splits into the
+    # reject-token (first mismatch d, min offset per anchor) and post-reject (discarded suffix) regions.
+    # Forward regions choose bernoulli_fkl | topk_fkl; reject regions choose reverse_kl | topk_fkl. Top-K is
+    # the in-model forward KL over the teacher/student top-K (both K > 0 -> union). SEMANTIC OVERLOAD: the
+    # top-K FKL rides in existing channels (response: model_output["log_probs"]; reject: the student channel).
+    # Defaults reproduce original draftopd (response Bernoulli forward, reject reverse KL). Pair each region
+    # mode with the matching verl_dflash_*_loss_mode model override.
+    response_loss_mode: str = "bernoulli_fkl"
+    reject_accept_loss_mode: str = "bernoulli_fkl"
+    reject_token_loss_mode: str = "reverse_kl"
+    post_reject_loss_mode: str = "reverse_kl"
+    topk_fkl_teacher_k: int = 64
+    topk_fkl_student_k: int = 0
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 

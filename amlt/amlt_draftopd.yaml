@@ -62,20 +62,17 @@ env_defaults:
   # FORWARD-ONLY draftopd: skip the reverse stream in the model (no reverse softmax / OOM), train only
   # the response forward KL. Override at submit: REJECTED_DRAFT_REVERSE=False amlt run ... --yes
   REJECTED_DRAFT_REVERSE: True
-  # CORRECTED_TOKEN_ONLY=True -> ablation: loss = mean Bernoulli forward KL ONLY on the corrected token at
-  # each SD reject position (drops accepted-position response loss AND the rejected-draft reverse stream;
-  # forces the model to skip the reverse compute). Override at submit: CORRECTED_TOKEN_ONLY=True amlt run ...
-  CORRECTED_TOKEN_ONLY: False
-  # ---- Top-K forward KL (in-model, from the frozen teacher's full logits). Default off = original
-  #      draftopd. TOPK_FKL_RESPONSE=True -> response forward term is a top-K forward KL (request 1).
-  #      TOPK_FKL_REJECT=True -> reject stream uses the SAME rollout-reject slots as baseline but a top-K
-  #      forward KL vs the teacher's realized-position top-K (teacher forcing), instead of reverse KL on
-  #      the rejected token's cached scalar (request 2; keeps offset decay). TOPK_FKL_MODE=teacher|student|union. ----
-  TOPK_FKL_RESPONSE: False
-  TOPK_FKL_REJECT: False
-  TOPK_FKL_MODE: teacher
-  TOPK_FKL_K: 64                # teacher-side top-K
-  TOPK_FKL_STUDENT_K: 0         # student-side top-K for union/student; 0 = reuse TOPK_FKL_K (symmetric)
+  # ---- Per-region loss selection. Response stream: RESPONSE_LOSS_MODE (accepted tokens) +
+  #      REJECT_ACCEPT_LOSS_MODE (corrected token y) in {bernoulli_fkl, topk_fkl}. Reject stream:
+  #      REJECT_TOKEN_LOSS_MODE (first mismatch d) + POST_REJECT_LOSS_MODE (discarded suffix) in
+  #      {reverse_kl, topk_fkl}. Defaults below reproduce original draftopd. Top-K is the in-model forward KL
+  #      over teacher/student top-K; TOPK_FKL_TEACHER_K & TOPK_FKL_STUDENT_K both > 0 -> union. ----
+  RESPONSE_LOSS_MODE: bernoulli_fkl
+  REJECT_ACCEPT_LOSS_MODE: bernoulli_fkl
+  REJECT_TOKEN_LOSS_MODE: reverse_kl
+  POST_REJECT_LOSS_MODE: reverse_kl
+  TOPK_FKL_TEACHER_K: 64        # teacher-side top-K (0 disables the teacher support)
+  TOPK_FKL_STUDENT_K: 0         # student-side top-K (0 disables; both > 0 -> union)
   # Reject-stream per-offset weighting: weight each rejected/FKL slot by DECAY^(offset-1) (offset = draft
   # head depth). Applies to BOTH the baseline reverse stream and the Request 2 top-K FKL. ENABLED=False ->
   # uniform weights. Matches the launcher defaults (True / 0.8); set here to make them tunable at submit.
@@ -142,11 +139,11 @@ jobs:
       - export REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT}
       - export RESUME_MODE=${RESUME_MODE}
       - export REJECTED_DRAFT_REVERSE=${REJECTED_DRAFT_REVERSE}
-      - export CORRECTED_TOKEN_ONLY=${CORRECTED_TOKEN_ONLY}
-      - export TOPK_FKL_RESPONSE=${TOPK_FKL_RESPONSE}
-      - export TOPK_FKL_REJECT=${TOPK_FKL_REJECT}
-      - export TOPK_FKL_MODE=${TOPK_FKL_MODE}
-      - export TOPK_FKL_K=${TOPK_FKL_K}
+      - export RESPONSE_LOSS_MODE=${RESPONSE_LOSS_MODE}
+      - export REJECT_ACCEPT_LOSS_MODE=${REJECT_ACCEPT_LOSS_MODE}
+      - export REJECT_TOKEN_LOSS_MODE=${REJECT_TOKEN_LOSS_MODE}
+      - export POST_REJECT_LOSS_MODE=${POST_REJECT_LOSS_MODE}
+      - export TOPK_FKL_TEACHER_K=${TOPK_FKL_TEACHER_K}
       - export TOPK_FKL_STUDENT_K=${TOPK_FKL_STUDENT_K}
       - export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED}
       - export REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY}

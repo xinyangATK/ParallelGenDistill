@@ -399,51 +399,69 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             value = os.getenv("VERL_DFLASH_DRAFT_SAMPLE_SEED", "-1")
         return int(value)
 
-    def _get_topk_fkl_response_enabled(self) -> bool:
-        """Request 1: response forward term is an in-model top-K forward KL instead of the scalar Bernoulli."""
-        value = getattr(self.config, "verl_dflash_topk_fkl_response_enabled", None)
-        if value is None:
-            value = os.getenv("VERL_DFLASH_TOPK_FKL_RESPONSE_ENABLED", "0")
-        return str(value).lower() in {"1", "true", "yes", "on"}
+    # Per-region loss-mode getters. Forward regions (response, reject-accept): bernoulli_fkl | topk_fkl;
+    # reject regions (reject-token, post-reject): reverse_kl | topk_fkl. Defaults = original draftopd.
+    _FORWARD_REGION_MODES = ("bernoulli_fkl", "topk_fkl")
+    _REJECT_REGION_MODES = ("reverse_kl", "topk_fkl")
 
-    def _get_topk_fkl_reject_enabled(self) -> bool:
-        """Request 2: reject stream is a top-K forward KL (vs realized-teacher top-K) on baseline's SAME
-        rollout-reject slots, replacing the scalar reverse KL. Reject-mode anchors only."""
-        value = getattr(self.config, "verl_dflash_topk_fkl_reject_enabled", None)
+    def _get_region_loss_mode(self, config_key: str, env_key: str, default: str, allowed: tuple) -> str:
+        value = getattr(self.config, config_key, None)
         if value is None:
-            value = os.getenv("VERL_DFLASH_TOPK_FKL_REJECT_ENABLED", "0")
-        return str(value).lower() in {"1", "true", "yes", "on"}
-
-    def _get_topk_fkl_mode(self) -> str:
-        """Top-K index selection for the forward KL: 'teacher' (default) | 'student' | 'union'."""
-        value = getattr(self.config, "verl_dflash_topk_fkl_mode", None)
-        if value is None:
-            value = os.getenv("VERL_DFLASH_TOPK_FKL_MODE", "teacher")
+            value = os.getenv(env_key, default)
         value = str(value).lower()
-        if value not in {"teacher", "student", "union"}:
-            raise ValueError(f"verl_dflash_topk_fkl_mode must be teacher|student|union, got {value!r}.")
+        if value not in allowed:
+            raise ValueError(f"{config_key} must be one of {allowed}, got {value!r}.")
         return value
 
-    def _get_topk_fkl_k(self) -> int:
-        value = getattr(self.config, "verl_dflash_topk_fkl_k", None)
-        if value is None:
-            value = os.getenv("VERL_DFLASH_TOPK_FKL_K", "64")
-        value = int(value)
-        if value <= 0:
-            raise ValueError(f"verl_dflash_topk_fkl_k must be positive, got {value}.")
-        return value
+    def _get_response_loss_mode(self) -> str:
+        return self._get_region_loss_mode(
+            "verl_dflash_response_loss_mode", "VERL_DFLASH_RESPONSE_LOSS_MODE", "bernoulli_fkl",
+            self._FORWARD_REGION_MODES,
+        )
 
-    def _get_topk_fkl_student_k(self) -> int:
-        """Student-side top-K for the union/student forward KL (the teacher side uses
-        verl_dflash_topk_fkl_k). 0 (default) -> reuse the teacher K, i.e. same K for both
-        (original behavior). Set a different value for an asymmetric union support set."""
-        value = getattr(self.config, "verl_dflash_topk_fkl_student_k", None)
+    def _get_reject_accept_loss_mode(self) -> str:
+        return self._get_region_loss_mode(
+            "verl_dflash_reject_accept_loss_mode", "VERL_DFLASH_REJECT_ACCEPT_LOSS_MODE", "bernoulli_fkl",
+            self._FORWARD_REGION_MODES,
+        )
+
+    def _get_reject_token_loss_mode(self) -> str:
+        return self._get_region_loss_mode(
+            "verl_dflash_reject_token_loss_mode", "VERL_DFLASH_REJECT_TOKEN_LOSS_MODE", "reverse_kl",
+            self._REJECT_REGION_MODES,
+        )
+
+    def _get_post_reject_loss_mode(self) -> str:
+        return self._get_region_loss_mode(
+            "verl_dflash_post_reject_loss_mode", "VERL_DFLASH_POST_REJECT_LOSS_MODE", "reverse_kl",
+            self._REJECT_REGION_MODES,
+        )
+
+    def _get_topk_fkl_k(self, config_key: str, env_key: str, default: str) -> int:
+        value = getattr(self.config, config_key, None)
         if value is None:
-            value = os.getenv("VERL_DFLASH_TOPK_FKL_STUDENT_K", "0")
+            value = os.getenv(env_key, default)
         value = int(value)
         if value < 0:
-            raise ValueError(f"verl_dflash_topk_fkl_student_k must be >= 0 (0 reuses teacher K), got {value}.")
+            raise ValueError(f"{config_key} must be >= 0, got {value}.")
         return value
+
+    def _get_topk_fkl_teacher_k(self) -> int:
+        return self._get_topk_fkl_k("verl_dflash_topk_fkl_teacher_k", "VERL_DFLASH_TOPK_FKL_TEACHER_K", "64")
+
+    def _get_topk_fkl_student_k(self) -> int:
+        return self._get_topk_fkl_k("verl_dflash_topk_fkl_student_k", "VERL_DFLASH_TOPK_FKL_STUDENT_K", "0")
+
+    @staticmethod
+    def _resolve_topk_fkl_mode(teacher_k: int, student_k: int) -> str:
+        """Top-K index set from the two K: both > 0 -> union, else the single non-zero side."""
+        if teacher_k > 0 and student_k > 0:
+            return "union"
+        if teacher_k > 0:
+            return "teacher"
+        if student_k > 0:
+            return "student"
+        raise ValueError("top-K forward KL requires verl_dflash_topk_fkl_teacher_k>0 or _student_k>0.")
 
     def _get_rejected_draft_max_tokens_per_sample(self) -> Optional[int]:
         value = getattr(self.config, "verl_dflash_rejected_draft_max_tokens_per_sample", None)
@@ -1057,19 +1075,20 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         rejected_draft_token_ids: Optional[torch.LongTensor],
         rejected_draft_teacher_logprobs: Optional[torch.Tensor],
         rejected_draft_mask: Optional[torch.Tensor],
-        compute_topk_fkl: bool = False,
+        reject_token_mode: str = "reverse_kl",
+        post_reject_mode: str = "reverse_kl",
         teacher_logits: Optional[torch.Tensor] = None,
         topk_fkl_mode: str = "teacher",
-        topk_fkl_k: int = 0,
+        topk_fkl_teacher_k: int = 0,
         topk_fkl_student_k: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Per rollout-rejected-draft slot, return (student, teacher, mask) in (batch, rejected_width).
-
-        Baseline (compute_topk_fkl=False): student = log q(d), teacher = cached scalar log p(d) (the loss
-        then takes reverse-KL). Request 2 (compute_topk_fkl=True): SAME slots, but student carries the
-        per-slot top-K forward KL vs the teacher's REALIZED-position top-K (teacher forcing, teacher_logits
-        at full_anchor+offset-1); teacher channel stays 0; slots whose realized target is past the response
-        end are dropped.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per rollout-rejected-draft slot, return (student, teacher, mask, is_reject_token), each
+        (batch, rejected_width). The min offset per anchor is the reject token (first mismatch d); larger
+        offsets are the post-reject suffix. Each region's loss mode picks per slot:
+          - reverse_kl: student = log q(d), teacher = cached scalar log p(d) (the loss takes reverse-KL);
+          - topk_fkl: student = top-K forward KL vs the teacher's REALIZED-position top-K (teacher forcing,
+            teacher_logits at full_anchor+offset-1), teacher channel 0; slots whose realized target is past
+            the response end are dropped (the reject token itself is never OOB).
         """
         batch_size = int(prompt_lengths.shape[0])
         rejected_width = 1
@@ -1079,100 +1098,131 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         student_tensor = draft_hidden.new_zeros((batch_size, rejected_width), dtype=torch.float32)
         teacher_tensor = draft_hidden.new_zeros((batch_size, rejected_width), dtype=torch.float32)
         mask_tensor = torch.zeros((batch_size, rejected_width), dtype=torch.bool, device=draft_hidden.device)
-        teacher_signal_missing = teacher_logits is None if compute_topk_fkl else rejected_draft_teacher_logprobs is None
+        is_reject_token_tensor = torch.zeros((batch_size, rejected_width), dtype=torch.bool, device=draft_hidden.device)
+        any_topk = reject_token_mode == "topk_fkl" or post_reject_mode == "topk_fkl"
+        any_reverse = reject_token_mode == "reverse_kl" or post_reject_mode == "reverse_kl"
         if (
             rejected_draft_anchor_indices is None
             or rejected_draft_offsets is None
             or rejected_draft_token_ids is None
-            or teacher_signal_missing
             or rejected_draft_mask is None
             or not bool(rejected_draft_mask.any())
+            or (any_topk and teacher_logits is None)
+            or (any_reverse and rejected_draft_teacher_logprobs is None)
         ):
-            return student_tensor, teacher_tensor, mask_tensor
+            return student_tensor, teacher_tensor, mask_tensor, is_reject_token_tensor
 
-        selected_batch_indices: list[int] = []
-        selected_draft_indices: list[int] = []
-        selected_token_ids: list[int] = []
-        selected_teacher_rows: list[int] = []
-        selected_item_indices: list[tuple[int, int]] = []
+        # Materialize the small (batch x width) metadata once to drive the per-slot routing on the host --
+        # avoids one GPU->CPU sync per slot (.item()/nonzero) in the loops below.
+        prompt_lens = prompt_lengths.tolist()
+        response_lens = response_lengths.tolist()
+        mask_l = rejected_draft_mask.tolist()
+        offset_l = rejected_draft_offsets.tolist()
+        token_l = rejected_draft_token_ids.tolist()
+        anchor_l = rejected_draft_anchor_indices.tolist()
+        anchor_pos_l = anchor_positions.tolist()
+        keep_l = block_keep_mask.tolist()
+        teacher_lp_l = rejected_draft_teacher_logprobs.tolist() if any_reverse else None
+        # Per-sample {full_anchor: block_idx} over the kept response blocks (first match wins).
+        anchor_to_block = [
+            {pos: blk for blk, (pos, kept) in reversed(list(enumerate(zip(anchor_pos_l[b], keep_l[b])))) if kept}
+            for b in range(batch_size)
+        ]
+
+        # Pass 1: collect candidate slots (basic filters + per-sample cap) and the min offset per anchor.
+        candidates: list[tuple] = []  # (batch_idx, item_idx, block_idx, offset, token_id, full_anchor, valid_len)
+        min_offset_by_anchor: list[dict[int, int]] = [dict() for _ in range(batch_size)]
         selected_counts = [0 for _ in range(batch_size)]
         for batch_idx in range(batch_size):
-            prompt_len = int(prompt_lengths[batch_idx].item())
-            response_len = int(response_lengths[batch_idx].item())
-            valid_len = prompt_len + response_len
+            prompt_len = int(prompt_lens[batch_idx])
+            valid_len = prompt_len + int(response_lens[batch_idx])
+            mapping = anchor_to_block[batch_idx]
             for item_idx in range(rejected_width):
-                if not bool(rejected_draft_mask[batch_idx, item_idx].item()):
+                if not mask_l[batch_idx][item_idx]:
                     continue
                 if max_tokens_per_sample is not None and selected_counts[batch_idx] >= max_tokens_per_sample:
                     continue
-                offset = int(rejected_draft_offsets[batch_idx, item_idx].item())
-                token_id = int(rejected_draft_token_ids[batch_idx, item_idx].item())
+                offset = int(offset_l[batch_idx][item_idx])
+                token_id = int(token_l[batch_idx][item_idx])
                 if offset <= 0 or offset >= draft_block_size or token_id < 0:
                     continue
-                anchor_resp = int(rejected_draft_anchor_indices[batch_idx, item_idx].item())
+                anchor_resp = int(anchor_l[batch_idx][item_idx])
                 full_anchor = prompt_len - 1 if anchor_resp < 0 else prompt_len + anchor_resp
                 if full_anchor < 0 or full_anchor >= valid_len:
                     continue
-                block_matches = (anchor_positions[batch_idx] == full_anchor) & block_keep_mask[batch_idx]
-                if not bool(block_matches.any()):
+                block_idx = mapping.get(full_anchor)
+                if block_idx is None:
                     continue
-                block_idx = int(torch.nonzero(block_matches, as_tuple=False)[0, 0].item())
-                teacher_row = -1
-                if compute_topk_fkl:
-                    # teacher-forcing target predicts the realized token at full_anchor+offset; drop if OOB.
-                    if full_anchor + offset >= valid_len:
-                        continue
-                    teacher_row = full_anchor + offset - 1
-                selected_batch_indices.append(batch_idx)
-                selected_draft_indices.append(block_idx * draft_block_size + offset)
-                selected_token_ids.append(token_id)
-                selected_teacher_rows.append(teacher_row)
-                selected_item_indices.append((batch_idx, item_idx))
+                candidates.append((batch_idx, item_idx, block_idx, offset, token_id, full_anchor, valid_len))
                 selected_counts[batch_idx] += 1
-                if not compute_topk_fkl:
-                    teacher_tensor[batch_idx, item_idx] = rejected_draft_teacher_logprobs[
-                        batch_idx, item_idx
-                    ].to(device=draft_hidden.device, dtype=torch.float32)
-                mask_tensor[batch_idx, item_idx] = True
+                prev = min_offset_by_anchor[batch_idx].get(full_anchor)
+                if prev is None or offset < prev:
+                    min_offset_by_anchor[batch_idx][full_anchor] = offset
 
-        if selected_batch_indices:
-            selected_item_batch_indices = torch.tensor(
-                [batch_idx for batch_idx, _ in selected_item_indices],
-                dtype=torch.long,
-                device=draft_hidden.device,
-            )
-            selected_item_column_indices = torch.tensor(
-                [item_idx for _, item_idx in selected_item_indices],
-                dtype=torch.long,
-                device=draft_hidden.device,
-            )
-            batch_index_tensor = torch.tensor(selected_batch_indices, dtype=torch.long, device=draft_hidden.device)
-            draft_index_tensor = torch.tensor(selected_draft_indices, dtype=torch.long, device=draft_hidden.device)
-            if compute_topk_fkl:
-                selected_values, _ = self._compute_topk_forward_kl(
-                    draft_hidden=draft_hidden,
-                    output_embeddings=output_embeddings,
-                    batch_indices=batch_index_tensor,
-                    draft_indices=draft_index_tensor,
-                    teacher_logits=teacher_logits,
-                    row_indices=torch.tensor(selected_teacher_rows, dtype=torch.long, device=draft_hidden.device),
-                    chunk_size=lm_head_chunk_size,
-                    mode=topk_fkl_mode,
-                    topk_teacher=topk_fkl_k,
-                    topk_student=topk_fkl_student_k,
-                )
+        # Pass 2: route each slot to reverse-KL data or the realized-teacher top-K FKL by its region's mode.
+        rev_batch: list[int] = []
+        rev_draft: list[int] = []
+        rev_tokens: list[int] = []
+        rev_items: list[tuple[int, int]] = []
+        rev_teacher: list[float] = []
+        topk_batch: list[int] = []
+        topk_draft: list[int] = []
+        topk_rows: list[int] = []
+        topk_items: list[tuple[int, int]] = []
+        for batch_idx, item_idx, block_idx, offset, token_id, full_anchor, valid_len in candidates:
+            is_reject_token = offset == min_offset_by_anchor[batch_idx][full_anchor]
+            mode = reject_token_mode if is_reject_token else post_reject_mode
+            draft_index = block_idx * draft_block_size + offset
+            if mode == "topk_fkl":
+                if full_anchor + offset >= valid_len:
+                    continue  # realized teacher target past the response end
+                topk_batch.append(batch_idx)
+                topk_draft.append(draft_index)
+                topk_rows.append(full_anchor + offset - 1)
+                topk_items.append((batch_idx, item_idx))
             else:
-                selected_values, _ = self._compute_selected_lm_log_probs(
-                    draft_hidden=draft_hidden,
-                    output_embeddings=output_embeddings,
-                    batch_indices=batch_index_tensor,
-                    draft_indices=draft_index_tensor,
-                    token_ids=torch.tensor(selected_token_ids, dtype=torch.long, device=draft_hidden.device),
-                    chunk_size=lm_head_chunk_size,
-                    calculate_entropy=False,
-                )
-            student_tensor[selected_item_batch_indices, selected_item_column_indices] = selected_values
-        return student_tensor, teacher_tensor, mask_tensor
+                rev_batch.append(batch_idx)
+                rev_draft.append(draft_index)
+                rev_tokens.append(token_id)
+                rev_items.append((batch_idx, item_idx))
+                rev_teacher.append(float(teacher_lp_l[batch_idx][item_idx]))
+            mask_tensor[batch_idx, item_idx] = True
+            is_reject_token_tensor[batch_idx, item_idx] = is_reject_token
+
+        def _long(values: list[int]) -> torch.Tensor:
+            return torch.tensor(values, dtype=torch.long, device=draft_hidden.device)
+
+        if rev_batch:
+            rev_values, _ = self._compute_selected_lm_log_probs(
+                draft_hidden=draft_hidden,
+                output_embeddings=output_embeddings,
+                batch_indices=_long(rev_batch),
+                draft_indices=_long(rev_draft),
+                token_ids=_long(rev_tokens),
+                chunk_size=lm_head_chunk_size,
+                calculate_entropy=False,
+            )
+            rev_rows = _long([b for b, _ in rev_items])
+            rev_cols = _long([c for _, c in rev_items])
+            student_tensor[rev_rows, rev_cols] = rev_values
+            teacher_tensor[rev_rows, rev_cols] = torch.tensor(
+                rev_teacher, dtype=torch.float32, device=draft_hidden.device
+            )
+        if topk_batch:
+            topk_values, _ = self._compute_topk_forward_kl(
+                draft_hidden=draft_hidden,
+                output_embeddings=output_embeddings,
+                batch_indices=_long(topk_batch),
+                draft_indices=_long(topk_draft),
+                teacher_logits=teacher_logits,
+                row_indices=_long(topk_rows),
+                chunk_size=lm_head_chunk_size,
+                mode=topk_fkl_mode,
+                topk_teacher=topk_fkl_teacher_k,
+                topk_student=topk_fkl_student_k,
+            )
+            student_tensor[_long([b for b, _ in topk_items]), _long([c for _, c in topk_items])] = topk_values
+        return student_tensor, teacher_tensor, mask_tensor, is_reject_token_tensor
 
     def _run_dflash_draft_forward(
         self,
@@ -1312,10 +1362,17 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         # draft sample drawn at each response-prediction position. Read the flag early so the teacher
         # forward can retain its full-vocab logits (needed to score log p(y_hat_j)).
         onpolicy_reverse_enabled = self._get_onpolicy_reverse_enabled()
-        # Top-K forward KL also needs the teacher's full-vocab logits at the realized positions.
-        topk_fkl_response_enabled = self._get_topk_fkl_response_enabled()
-        topk_fkl_reject_enabled = self._get_topk_fkl_reject_enabled()
-        topk_fkl_enabled = topk_fkl_response_enabled or topk_fkl_reject_enabled
+        # Per-region loss selection (see _get_*_loss_mode). Any region on top-K needs the teacher's
+        # full-vocab logits at the realized positions, so retain them (as paradistill also does).
+        response_loss_mode = self._get_response_loss_mode()
+        reject_accept_loss_mode = self._get_reject_accept_loss_mode()
+        reject_token_loss_mode = self._get_reject_token_loss_mode()
+        post_reject_loss_mode = self._get_post_reject_loss_mode()
+        response_topk = response_loss_mode == "topk_fkl"
+        reject_accept_topk = reject_accept_loss_mode == "topk_fkl"
+        reject_token_topk = reject_token_loss_mode == "topk_fkl"
+        post_reject_topk = post_reject_loss_mode == "topk_fkl"
+        topk_fkl_enabled = response_topk or reject_accept_topk or reject_token_topk or post_reject_topk
         retain_teacher_logits = onpolicy_reverse_enabled or topk_fkl_enabled
 
         target_kwargs = dict(kwargs)
@@ -1378,32 +1435,22 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 "draftopd top-K forward KL is not supported together with on-policy reverse or random "
                 "response anchors."
             )
-        if topk_fkl_reject_enabled and response_anchor_mode != "reject":
+        if (reject_token_topk or post_reject_topk) and response_anchor_mode != "reject":
             raise NotImplementedError(
-                "draftopd reject-stream top-K forward KL (verl_dflash_topk_fkl_reject_enabled) requires "
-                "reject-mode anchors."
+                "draftopd reject-region top-K forward KL (reject_token/post_reject loss_mode=topk_fkl) "
+                "requires reject-mode anchors."
             )
-        topk_fkl_mode = self._get_topk_fkl_mode() if topk_fkl_enabled else "teacher"
-        topk_fkl_k = self._get_topk_fkl_k() if topk_fkl_enabled else 0
-        # Student-side K for student/union support; 0 -> reuse the teacher K (symmetric, original behavior).
+        topk_fkl_teacher_k = self._get_topk_fkl_teacher_k() if topk_fkl_enabled else 0
         topk_fkl_student_k = self._get_topk_fkl_student_k() if topk_fkl_enabled else 0
-        if topk_fkl_student_k <= 0:
-            topk_fkl_student_k = topk_fkl_k
+        topk_fkl_mode = self._resolve_topk_fkl_mode(topk_fkl_teacher_k, topk_fkl_student_k) if topk_fkl_enabled else "teacher"
         split_random_rejected_pass = random_response_anchor_enabled
-        # The rollout-reject reverse stream (_collect_rejected_draft_log_probs + its anchors) is intrinsic
-        # to reject-mode anchors (draftopd). With free anchors (paradistill: stride_k/sampled) it has no
-        # meaning, so when on-policy reverse is also off the model emits NO reverse stream -> response
-        # forward-KL only (this makes paradistill ONPOLICY_REVERSE=False a true forward-only run). In
-        # reject mode it can also be turned off explicitly (verl_dflash_rejected_draft_reverse_enabled=
-        # False) for a forward-only draftopd -- skipping the reverse compute, not just zeroing its loss.
-        reject_reverse_enabled = (
-            response_anchor_mode == "reject"
-            and self._get_rejected_draft_reverse_enabled()
-            and not topk_fkl_reject_enabled
+        # The rollout-reject stream exists only for reject-mode anchors (draftopd); free anchors (paradistill)
+        # have none. verl_dflash_rejected_draft_reverse_enabled=False skips the whole reject-stream compute
+        # (no LM-head softmax over the slots), not just zeros its loss.
+        reject_stream_active = (
+            response_anchor_mode == "reject" and self._get_rejected_draft_reverse_enabled()
         )
-        # Both the reverse stream and the Request 2 top-K FKL run on the rollout-reject slots, so both need
-        # those anchors in the draft forward.
-        need_rollout_reject_anchors = reject_reverse_enabled or topk_fkl_reject_enabled
+        need_rollout_reject_anchors = reject_stream_active
         anchor_positions, segment_lens, row_starts, block_keep_mask, valid_seq_lens, opd_metrics = (
             self._build_opd_anchor_plan(
                 input_ids=input_ids,
@@ -1487,6 +1534,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         rejected_student_log_probs = target_hidden.new_zeros((batch_size, rejected_width), dtype=torch.float32)
         rejected_teacher_log_probs = target_hidden.new_zeros((batch_size, rejected_width), dtype=torch.float32)
         rejected_loss_mask = torch.zeros((batch_size, rejected_width), dtype=torch.bool, device=input_ids.device)
+        # Per-slot reject-token vs post-reject tag (see _collect_rejected_draft_log_probs); used by the loss
+        # only for mixed reject regions. All-False for paradistill / no-reject.
+        rejected_is_reject_token = torch.zeros((batch_size, rejected_width), dtype=torch.bool, device=input_ids.device)
         # paradistill reverse stream is kept FLAT (one entry per re-sampled (block, offset) slot), NOT scattered
         # by sequence position. Overlapping blocks (sampled-mode anchors) each re-sample their own fresh
         # draft token from a different head/context, so every slot is a distinct on-policy sample and must
@@ -1568,37 +1618,73 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     # Each slot's draft index packs anchor_block * block_size + offset, so the offset (the
                     # draft head index, 1..K) recovers from a modulo -- used for optional per-offset decay.
                     onpolicy_flat_offsets = response_draft_tensor % draft_block_size
-                elif topk_fkl_response_enabled:
-                    # Request 1: SEMANTIC OVERLOAD -- the per-position top-K FKL is scattered into the
-                    # "log_probs" channel in place of log q(y_j) (loss reads log_probs as the FKL), so no
-                    # new model-output key / transformer_impl passthrough is needed.
-                    selected_log_probs, selected_entropy = self._compute_topk_forward_kl(
-                        draft_hidden=draft_hidden,
-                        output_embeddings=output_embeddings,
-                        batch_indices=response_batch_tensor,
-                        draft_indices=response_draft_tensor,
-                        teacher_logits=teacher_logits,
-                        row_indices=response_row_tensor,
-                        chunk_size=lm_head_chunk_size,
-                        mode=topk_fkl_mode,
-                        topk_teacher=topk_fkl_k,
-                        topk_student=topk_fkl_student_k,
-                        calculate_entropy=calculate_entropy,
-                    )
+                    log_probs_by_seq[response_batch_tensor, response_row_tensor] = selected_log_probs
+                    loss_mask_by_seq[response_batch_tensor, response_row_tensor] = 1.0
+                    if entropy_by_seq is not None and selected_entropy is not None:
+                        entropy_by_seq[response_batch_tensor, response_row_tensor] = selected_entropy
                 else:
-                    selected_log_probs, selected_entropy = self._compute_selected_lm_log_probs(
-                        draft_hidden=draft_hidden,
-                        output_embeddings=output_embeddings,
-                        batch_indices=response_batch_tensor,
-                        draft_indices=response_draft_tensor,
-                        token_ids=response_label_tensor,
-                        chunk_size=lm_head_chunk_size,
-                        calculate_entropy=calculate_entropy,
+                    # Forward response stream: each slot's log_probs channel holds log q(y_j) or (SEMANTIC
+                    # OVERLOAD) a top-K FKL. Split response (accepted) vs reject-accept (corrected y) only when
+                    # their modes differ; else one uniform call reproduces the pre-refactor path.
+                    response_split = (
+                        response_anchor_mode == "reject" and response_loss_mode != reject_accept_loss_mode
                     )
-                log_probs_by_seq[response_batch_tensor, response_row_tensor] = selected_log_probs
-                loss_mask_by_seq[response_batch_tensor, response_row_tensor] = 1.0
-                if entropy_by_seq is not None and selected_entropy is not None:
-                    entropy_by_seq[response_batch_tensor, response_row_tensor] = selected_entropy
+                    if response_split:
+                        # corrected (reject-accept) = the predicted label token sits at an SD reject position.
+                        corrected_seq_mask = torch.zeros(
+                            (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
+                        )
+                        if reject_token_indices is not None and reject_token_indices.numel() > 0:
+                            rj = reject_token_indices.to(torch.long)
+                            rj_valid = (rj >= 0) & (rj < response_lengths.unsqueeze(1))
+                            seq_pos = (prompt_lengths.unsqueeze(1) + rj).clamp_(0, seq_len - 1)
+                            rows = torch.arange(batch_size, device=input_ids.device).unsqueeze(1).expand_as(rj)
+                            corrected_seq_mask[rows[rj_valid], seq_pos[rj_valid]] = True
+                        slot_is_corrected = corrected_seq_mask[response_batch_tensor, response_row_tensor + 1]
+                        slot_topk = (slot_is_corrected & reject_accept_topk) | (
+                            slot_is_corrected.logical_not() & response_topk
+                        )
+                    else:
+                        slot_topk = torch.full(
+                            (response_batch_tensor.numel(),), response_topk, dtype=torch.bool,
+                            device=input_ids.device,
+                        )
+                    for take_topk in (False, True):
+                        sel = slot_topk if take_topk else slot_topk.logical_not()
+                        if not bool(sel.any()):
+                            continue
+                        sub = torch.nonzero(sel, as_tuple=False).squeeze(-1)
+                        sub_batch = response_batch_tensor[sub]
+                        sub_draft = response_draft_tensor[sub]
+                        sub_row = response_row_tensor[sub]
+                        if take_topk:
+                            sub_vals, sub_entropy = self._compute_topk_forward_kl(
+                                draft_hidden=draft_hidden,
+                                output_embeddings=output_embeddings,
+                                batch_indices=sub_batch,
+                                draft_indices=sub_draft,
+                                teacher_logits=teacher_logits,
+                                row_indices=sub_row,
+                                chunk_size=lm_head_chunk_size,
+                                mode=topk_fkl_mode,
+                                topk_teacher=topk_fkl_teacher_k,
+                                topk_student=topk_fkl_student_k,
+                                calculate_entropy=calculate_entropy,
+                            )
+                        else:
+                            sub_vals, sub_entropy = self._compute_selected_lm_log_probs(
+                                draft_hidden=draft_hidden,
+                                output_embeddings=output_embeddings,
+                                batch_indices=sub_batch,
+                                draft_indices=sub_draft,
+                                token_ids=response_label_tensor[sub],
+                                chunk_size=lm_head_chunk_size,
+                                calculate_entropy=calculate_entropy,
+                            )
+                        log_probs_by_seq[sub_batch, sub_row] = sub_vals
+                        loss_mask_by_seq[sub_batch, sub_row] = 1.0
+                        if entropy_by_seq is not None and sub_entropy is not None:
+                            entropy_by_seq[sub_batch, sub_row] = sub_entropy
                 response_lm_token_count = response_batch_tensor.numel()
 
             if onpolicy_reverse_enabled:
@@ -1619,51 +1705,35 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     rejected_loss_mask[response_batch_tensor, col] = True
                     rejected_offsets[response_batch_tensor, col] = onpolicy_flat_offsets.to(torch.long)
                     rejected_draft_offsets = rejected_offsets
-            elif topk_fkl_reject_enabled:
-                # Request 2: SAME rollout-reject slots as baseline, only the loss differs (top-K FKL vs
-                # realized-teacher top-K). SEMANTIC OVERLOAD: the FKL rides in the "student_log_probs"
-                # channel; offsets stay the rollout offsets so decay^(offset-1) applies unchanged.
-                rejected_student_log_probs, rejected_teacher_log_probs, rejected_loss_mask = (
-                    self._collect_rejected_draft_log_probs(
-                        draft_hidden=draft_hidden,
-                        output_embeddings=output_embeddings,
-                        prompt_lengths=prompt_lengths,
-                        response_lengths=response_lengths,
-                        anchor_positions=anchor_positions,
-                        block_keep_mask=block_keep_mask,
-                        draft_block_size=draft_block_size,
-                        lm_head_chunk_size=lm_head_chunk_size,
-                        max_tokens_per_sample=rejected_draft_max_tokens_per_sample,
-                        rejected_draft_anchor_indices=rejected_draft_anchor_indices,
-                        rejected_draft_offsets=rejected_draft_offsets,
-                        rejected_draft_token_ids=rejected_draft_token_ids,
-                        rejected_draft_teacher_logprobs=rejected_draft_teacher_logprobs,
-                        rejected_draft_mask=rejected_draft_mask,
-                        compute_topk_fkl=True,
-                        teacher_logits=teacher_logits,
-                        topk_fkl_mode=topk_fkl_mode,
-                        topk_fkl_k=topk_fkl_k,
-                        topk_fkl_student_k=topk_fkl_student_k,
-                    )
-                )
-            elif not split_random_rejected_pass and reject_reverse_enabled:
-                rejected_student_log_probs, rejected_teacher_log_probs, rejected_loss_mask = (
-                    self._collect_rejected_draft_log_probs(
-                        draft_hidden=draft_hidden,
-                        output_embeddings=output_embeddings,
-                        prompt_lengths=prompt_lengths,
-                        response_lengths=response_lengths,
-                        anchor_positions=anchor_positions,
-                        block_keep_mask=block_keep_mask,
-                        draft_block_size=draft_block_size,
-                        lm_head_chunk_size=lm_head_chunk_size,
-                        max_tokens_per_sample=rejected_draft_max_tokens_per_sample,
-                        rejected_draft_anchor_indices=rejected_draft_anchor_indices,
-                        rejected_draft_offsets=rejected_draft_offsets,
-                        rejected_draft_token_ids=rejected_draft_token_ids,
-                        rejected_draft_teacher_logprobs=rejected_draft_teacher_logprobs,
-                        rejected_draft_mask=rejected_draft_mask,
-                    )
+            elif reject_stream_active and not split_random_rejected_pass:
+                # draftopd reject stream: reject-token + post-reject regions, each reverse_kl or top-K FKL
+                # (SEMANTIC OVERLOAD: both ride in the student/teacher channels; offsets stay raw for decay).
+                (
+                    rejected_student_log_probs,
+                    rejected_teacher_log_probs,
+                    rejected_loss_mask,
+                    rejected_is_reject_token,
+                ) = self._collect_rejected_draft_log_probs(
+                    draft_hidden=draft_hidden,
+                    output_embeddings=output_embeddings,
+                    prompt_lengths=prompt_lengths,
+                    response_lengths=response_lengths,
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                    draft_block_size=draft_block_size,
+                    lm_head_chunk_size=lm_head_chunk_size,
+                    max_tokens_per_sample=rejected_draft_max_tokens_per_sample,
+                    rejected_draft_anchor_indices=rejected_draft_anchor_indices,
+                    rejected_draft_offsets=rejected_draft_offsets,
+                    rejected_draft_token_ids=rejected_draft_token_ids,
+                    rejected_draft_teacher_logprobs=rejected_draft_teacher_logprobs,
+                    rejected_draft_mask=rejected_draft_mask,
+                    reject_token_mode=reject_token_loss_mode,
+                    post_reject_mode=post_reject_loss_mode,
+                    teacher_logits=teacher_logits,
+                    topk_fkl_mode=topk_fkl_mode,
+                    topk_fkl_teacher_k=topk_fkl_teacher_k,
+                    topk_fkl_student_k=topk_fkl_student_k,
                 )
             del draft_hidden
 
@@ -1680,23 +1750,32 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             draft_forward_ms += rejected_draft_forward_ms
             attn_impl = rejected_attn_impl
             ran_draft_forward = True
-            rejected_student_log_probs, rejected_teacher_log_probs, rejected_loss_mask = (
-                self._collect_rejected_draft_log_probs(
-                    draft_hidden=rejected_draft_hidden,
-                    output_embeddings=output_embeddings,
-                    prompt_lengths=prompt_lengths,
-                    response_lengths=response_lengths,
-                    anchor_positions=rejected_anchor_positions,
-                    block_keep_mask=rejected_block_keep_mask,
-                    draft_block_size=draft_block_size,
-                    lm_head_chunk_size=lm_head_chunk_size,
-                    max_tokens_per_sample=rejected_draft_max_tokens_per_sample,
-                    rejected_draft_anchor_indices=rejected_draft_anchor_indices,
-                    rejected_draft_offsets=rejected_draft_offsets,
-                    rejected_draft_token_ids=rejected_draft_token_ids,
-                    rejected_draft_teacher_logprobs=rejected_draft_teacher_logprobs,
-                    rejected_draft_mask=rejected_draft_mask,
-                )
+            (
+                rejected_student_log_probs,
+                rejected_teacher_log_probs,
+                rejected_loss_mask,
+                rejected_is_reject_token,
+            ) = self._collect_rejected_draft_log_probs(
+                draft_hidden=rejected_draft_hidden,
+                output_embeddings=output_embeddings,
+                prompt_lengths=prompt_lengths,
+                response_lengths=response_lengths,
+                anchor_positions=rejected_anchor_positions,
+                block_keep_mask=rejected_block_keep_mask,
+                draft_block_size=draft_block_size,
+                lm_head_chunk_size=lm_head_chunk_size,
+                max_tokens_per_sample=rejected_draft_max_tokens_per_sample,
+                rejected_draft_anchor_indices=rejected_draft_anchor_indices,
+                rejected_draft_offsets=rejected_draft_offsets,
+                rejected_draft_token_ids=rejected_draft_token_ids,
+                rejected_draft_teacher_logprobs=rejected_draft_teacher_logprobs,
+                rejected_draft_mask=rejected_draft_mask,
+                reject_token_mode=reject_token_loss_mode,
+                post_reject_mode=post_reject_loss_mode,
+                teacher_logits=teacher_logits,
+                topk_fkl_mode=topk_fkl_mode,
+                topk_fkl_teacher_k=topk_fkl_teacher_k,
+                topk_fkl_student_k=topk_fkl_student_k,
             )
             del rejected_draft_hidden
 
@@ -1730,6 +1809,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             "dflash_rejected_draft_offsets": rejected_draft_offsets
             if rejected_draft_offsets is not None
             else torch.zeros_like(rejected_loss_mask, dtype=torch.long),
+            "dflash_rejected_draft_is_reject_token": rejected_is_reject_token,
             "dflash_opd_rejected_draft_token_count": rejected_lm_token_count,
             "dflash_opd_actual_block_count": actual_block_count.to(dtype=torch.float32),
             "dflash_opd_padded_block_count": log_probs_by_seq.new_tensor(padded_block_count),

@@ -579,16 +579,6 @@ def distillation_loss(
     assert distillation_config is not None
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
     rejected_draft_stream = get_rejected_draft_distillation_stream(model_output)
-    corrected_token_only = bool(getattr(loss_config, "corrected_token_only", False))
-    if corrected_token_only:
-        if loss_config.use_policy_gradient:
-            raise NotImplementedError(
-                "corrected_token_only is a supervised forward-KL ablation; set use_policy_gradient=False."
-            )
-        # Keep ONLY the response Bernoulli forward-KL at corrected (SD reject) positions: drop the
-        # rejected-draft reverse stream entirely (the model should also skip its compute via
-        # verl_dflash_rejected_draft_reverse_enabled=False so no reverse softmax is run).
-        rejected_draft_stream = None
     if rejected_draft_stream is not None and loss_config.loss_mode == "forward_kl_topk":
         raise NotImplementedError("DFLASH rejected draft token training is not supported with forward_kl_topk.")
     if rejected_draft_stream is not None and loss_config.use_policy_gradient:
@@ -604,14 +594,6 @@ def distillation_loss(
     )
     response_mask = _padded_response_mask(data["response_mask"])
     effective_response_mask = get_effective_distillation_response_mask(data=data, model_output=model_output)
-    if corrected_token_only:
-        # Restrict the trained positions to SD reject positions (the corrected token y). These are the
-        # last token of each accepted run, already scored by the response stream -- so this is a pure mask.
-        corrected_mask = _build_corrected_token_mask(data, effective_response_mask)
-        effective_response_mask = effective_response_mask & corrected_mask
-        distillation_metrics["distillation/corrected_token_count"] = Metric(
-            AggregationType.SUM, effective_response_mask.sum().to(torch.float32)
-        )
     loss_agg_mode = config.loss_agg_mode
 
     distillation_metrics.update(
@@ -661,14 +643,8 @@ def distillation_loss(
             rejected_draft_mask=rejected_draft_mask,
             loss_config=loss_config,
         )
-        if getattr(loss_config, "topk_fkl_reject_enabled", False):
-            # Request 2: SEMANTIC OVERLOAD -- rejected_student_log_probs holds the per-slot top-K FKL (not
-            # log q(d)), so use it directly; the reverse-KL combine is bypassed. Offset decay still applies.
-            rejected_draft_losses = rejected_student_log_probs.to(dtype=distillation_losses.dtype)
-            distillation_metrics["distillation/rejected_draft_topk_fkl_loss"] = Metric(
-                AggregationType.MEAN, _valid_mean(rejected_draft_losses, rejected_draft_mask)
-            )
-        else:
+        if loss_config.onpolicy_reverse_enabled:
+            # paradistill: fresh on-policy sample reverse stream -> the standard sampled reverse/forward combine.
             rejected_draft_losses, rejected_component_metrics = _combine_sampled_reverse_forward_losses(
                 student_log_probs=rejected_student_log_probs,
                 teacher_log_probs=rejected_teacher_log_probs,
@@ -678,6 +654,36 @@ def distillation_loss(
                 force_reverse_kl=bool(getattr(loss_config, "rejected_draft_use_reverse_kl", False)),
             )
             distillation_metrics.update(rejected_component_metrics)
+        else:
+            # draftopd reject stream: per slot reverse KL (kl_penalty on log q(d) vs cached log p(d)) or the
+            # top-K FKL in the student channel, by region (reject-token = is_reject_token). Decay applies below.
+            reject_token_topk = str(getattr(loss_config, "reject_token_loss_mode", "reverse_kl")) == "topk_fkl"
+            post_reject_topk = str(getattr(loss_config, "post_reject_loss_mode", "reverse_kl")) == "topk_fkl"
+            if reject_token_topk and post_reject_topk:
+                rejected_draft_losses = rejected_student_log_probs.to(dtype=distillation_losses.dtype)
+            else:
+                reverse_losses = kl_penalty(
+                    logprob=rejected_student_log_probs,
+                    ref_logprob=rejected_teacher_log_probs,
+                    kl_penalty=_sampled_kl_loss_mode(loss_config),
+                ).to(dtype=distillation_losses.dtype)
+                if not reject_token_topk and not post_reject_topk:
+                    rejected_draft_losses = reverse_losses
+                else:
+                    is_reject_token = model_output.get("opd_rejected_draft_is_reject_token")
+                    if is_reject_token is None:
+                        raise RuntimeError(
+                            "Mixed draftopd reject-region losses require opd_rejected_draft_is_reject_token."
+                        )
+                    is_reject_token = _flatten_nested_tensor(is_reject_token).to(
+                        device=rejected_draft_mask.device
+                    ).bool()
+                    slot_topk = (is_reject_token & reject_token_topk) | (
+                        is_reject_token.logical_not() & post_reject_topk
+                    )
+                    rejected_draft_losses = torch.where(
+                        slot_topk, rejected_student_log_probs.to(dtype=reverse_losses.dtype), reverse_losses
+                    )
         if loss_config.loss_max_clamp is not None:
             rejected_clamp_fraction = _compute_loss_clamp_fraction(
                 rejected_draft_losses, rejected_draft_mask, loss_config.loss_max_clamp
@@ -697,9 +703,7 @@ def distillation_loss(
             AggregationType.MEAN, rejected_valid_losses.mean()
         )
 
-    if not bool(effective_response_mask.any()) and rejected_draft_losses is None and not corrected_token_only:
-        # corrected_token_only is excluded here so it always reaches its branch below, where _global_sum is
-        # called on every rank -- returning early on an empty microbatch would diverge the dp collective.
+    if not bool(effective_response_mask.any()) and rejected_draft_losses is None:
         if "log_probs" in model_output:
             zero_loss = no_padding_2_padding(model_output["log_probs"], data).sum() * 0.0
         else:
@@ -729,25 +733,7 @@ def distillation_loss(
         distillation_metrics.update(pg_metrics)
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
-        if corrected_token_only:
-            # Mean Bernoulli forward-KL over corrected (SD reject) tokens only. Normalize by the GLOBAL
-            # corrected-token count (all-reduced on EVERY corrected_token_only rank -- the early-return above
-            # is disabled for this mode -- so the dp collective never diverges). dp_size cancels FSDP's
-            # gradient mean, giving a true global mean over corrected tokens.
-            global_batch_info = getattr(config, "global_batch_info", {}) or {}
-            dp_size = global_batch_info.get("dp_size", 1)
-            corrected_sum = (distillation_losses * effective_response_mask).sum()
-            global_corrected_count = _global_sum(
-                effective_response_mask.sum().to(distillation_losses.dtype), dp_group
-            )
-            if global_corrected_count.item() <= 0:
-                if "log_probs" in model_output:
-                    distillation_loss = no_padding_2_padding(model_output["log_probs"], data).sum() * 0.0
-                else:
-                    distillation_loss = distillation_losses.sum() * 0.0
-            else:
-                distillation_loss = corrected_sum / global_corrected_count * dp_size
-        elif rejected_draft_losses is None:
+        if rejected_draft_losses is None:
             distillation_loss = agg_loss(
                 loss_mat=distillation_losses,
                 loss_mask=effective_response_mask,
@@ -770,10 +756,14 @@ def distillation_loss(
             global_rejected_effective_count = global_batch_info.get(
                 "opd_rejected_draft_batch_effective_num_tokens"
             )
-            if loss_config.onpolicy_reverse_enabled or getattr(loss_config, "topk_fkl_reject_enabled", False):
-                # paradistill / draftopd reject top-K FKL build their own (block, offset) slots that do not
-                # match the engine's rollout-reject counts, so all-reduce the actual local slot count and
-                # the local decay-weight sum instead (a no-op on CPU / single rank).
+            reject_is_topk = (
+                str(getattr(loss_config, "reject_token_loss_mode", "reverse_kl")) == "topk_fkl"
+                or str(getattr(loss_config, "post_reject_loss_mode", "reverse_kl")) == "topk_fkl"
+            )
+            if loss_config.onpolicy_reverse_enabled or reject_is_topk:
+                # paradistill / draftopd reject top-K FKL build their own (block, offset) slots (and top-K
+                # drops OOB suffix slots) that do not match the engine's rollout-reject counts, so all-reduce
+                # the actual local slot count and the local decay-weight sum instead (no-op on CPU / 1 rank).
                 global_rejected_count = _global_sum(rejected_count, dp_group)
                 global_rejected_effective_count = _global_sum(rejected_effective_count, dp_group)
             else:
@@ -965,20 +955,28 @@ def compute_distillation_loss_reverse_kl_estimator(
     - distillation_metrics: Dictionary of metrics.
     """
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
-    # Request 1: SEMANTIC OVERLOAD -- when topk_fkl_response is on, model_output["log_probs"] holds the
-    # per-position top-K FKL (not log q(y_j)), so consume it directly as the response loss.
-    if getattr(loss_config, "topk_fkl_response_enabled", False):
-        distillation_losses = no_padding_2_padding(model_output["log_probs"], data)
-        response_mask_bool = get_effective_distillation_response_mask(data=data, model_output=model_output)
+    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
+    response_mask_bool = get_effective_distillation_response_mask(data=data, model_output=model_output)
+    # draftopd response stream (SEMANTIC OVERLOAD): log_probs holds log q(y_j) or a top-K FKL per position.
+    # When a forward region is top-K, select per position by the corrected (reject-accept) mask; else fall
+    # through to the standard forward/reverse path (byte-identical to before, incl. general distillation).
+    response_topk = str(getattr(loss_config, "response_loss_mode", "bernoulli_fkl")) == "topk_fkl"
+    reject_accept_topk = str(getattr(loss_config, "reject_accept_loss_mode", "bernoulli_fkl")) == "topk_fkl"
+    if response_topk or reject_accept_topk:
+        teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+        corrected = _build_corrected_token_mask(data, response_mask_bool)
+        use_topk = (corrected & reject_accept_topk) | (corrected.logical_not() & response_topk)
+        bernoulli_losses = _local_bernoulli_forward_kl(
+            student_log_probs=student_log_probs, teacher_log_probs=teacher_log_probs, loss_config=loss_config
+        )
+        distillation_losses = torch.where(use_topk, student_log_probs, bernoulli_losses)
         return distillation_losses, {
-            "distillation/response_topk_fkl_loss": Metric(
+            "distillation/response_forward_loss": Metric(
                 AggregationType.MEAN, _valid_mean(distillation_losses, response_mask_bool)
             )
         }
 
-    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
     teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
-    response_mask_bool = get_effective_distillation_response_mask(data=data, model_output=model_output)
     assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
     # Per-position form (always on): response tokens at SD reject positions (corrected token y) use
     # forward-KL only -- the reverse-KL at a reject position is handled by the rejected-draft stream on

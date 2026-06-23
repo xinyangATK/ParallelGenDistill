@@ -1577,6 +1577,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 dflash_rejected_draft_teacher_log_probs = output.get("dflash_rejected_draft_teacher_log_probs")
                 dflash_rejected_draft_loss_mask = output.get("dflash_rejected_draft_loss_mask")
                 dflash_rejected_draft_offsets = output.get("dflash_rejected_draft_offsets")
+                dflash_rejected_draft_is_reject_token = output.get("dflash_rejected_draft_is_reject_token")
                 eagle3_native_ce_losses = output.get("eagle3_native_ce_losses")
                 eagle3_selected_scalar_loss_mask = output.get("eagle3_selected_scalar_loss_mask")
             else:
@@ -1591,6 +1592,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 )
                 dflash_rejected_draft_loss_mask = getattr(output, "dflash_rejected_draft_loss_mask", None)
                 dflash_rejected_draft_offsets = getattr(output, "dflash_rejected_draft_offsets", None)
+                dflash_rejected_draft_is_reject_token = getattr(
+                    output, "dflash_rejected_draft_is_reject_token", None
+                )
                 eagle3_native_ce_losses = getattr(output, "eagle3_native_ce_losses", None)
                 eagle3_selected_scalar_loss_mask = getattr(output, "eagle3_selected_scalar_loss_mask", None)
 
@@ -1632,6 +1636,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 model_output["opd_rejected_draft_loss_mask"] = dflash_rejected_draft_loss_mask
             if dflash_rejected_draft_offsets is not None:
                 model_output["opd_rejected_draft_offsets"] = dflash_rejected_draft_offsets
+            if dflash_rejected_draft_is_reject_token is not None:
+                model_output["opd_rejected_draft_is_reject_token"] = dflash_rejected_draft_is_reject_token
             for source_key, output_key in (
                 ("dflash_opd_valid_anchor_count", "opd_valid_anchor_count"),
                 ("dflash_opd_skipped_sample_count", "opd_skipped_sample_count"),

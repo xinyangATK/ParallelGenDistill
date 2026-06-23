@@ -7,7 +7,6 @@ cd "$REPO_ROOT"
 DISTILLATION_LOSS_MODE=${DISTILLATION_LOSS_MODE:-k3}
 REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT:-0.0}
 FORWARD_KL_WEIGHT=${FORWARD_KL_WEIGHT:-1.0}
-REJECTED_DRAFT_USE_REVERSE_KL=${REJECTED_DRAFT_USE_REVERSE_KL:-True}
 LR=${LR:-3e-4}
 TEST_FREQ=${TEST_FREQ:-250}
 SAVE_FREQ=${SAVE_FREQ:-500}
@@ -38,36 +37,22 @@ REJECTED_DRAFT_REVERSE=${REJECTED_DRAFT_REVERSE:-True}
 case "${REJECTED_DRAFT_REVERSE,,}" in
     false | 0 | no | off) rejected_draft_stream_weight=0.0 ;;
 esac
-# CORRECTED_TOKEN_ONLY=True -> draftopd ablation: the loss is the mean Bernoulli forward KL computed ONLY on
-# the corrected token at each SD reject position. Drops the accepted-position response loss AND the
-# rejected-draft reverse stream entirely (forces the model to skip the reverse compute, like
-# REJECTED_DRAFT_REVERSE=False -> no reverse LM-head softmax / OOM). Keep the response forward-only
-# (REVERSE_KL_WEIGHT=0, FORWARD_KL_WEIGHT=1, the defaults above).
-CORRECTED_TOKEN_ONLY=${CORRECTED_TOKEN_ONLY:-False}
-case "${CORRECTED_TOKEN_ONLY,,}" in
-    true | 1 | yes | on)
-        REJECTED_DRAFT_REVERSE=False
-        rejected_draft_stream_weight=0.0
-        ;;
-esac
 REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED:-True}
 REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY:-0.8}
 RANDOM_RESPONSE_ANCHOR_ENABLED=${RANDOM_RESPONSE_ANCHOR_ENABLED:-False}
 RANDOM_RESPONSE_ANCHOR_SEED=${RANDOM_RESPONSE_ANCHOR_SEED:-42}
-# draftopd top-K forward KL (computed in-model from the frozen teacher's full logits). Default off ->
-# original draftopd (scalar Bernoulli response forward + reverse KL on the rollout-rejected token).
-#   TOPK_FKL_RESPONSE=True  -> request 1: response forward term becomes a top-K forward KL.
-#   TOPK_FKL_REJECT=True    -> request 2: reject stream uses the SAME rollout-reject slots as baseline
-#                              (same anchors/block split/offsets) but a top-K forward KL vs the teacher's
-#                              realized-position top-K (teacher forcing), instead of reverse KL on the
-#                              rejected token's cached scalar. Keeps offset decay.
-#   TOPK_FKL_MODE=teacher|student|union  (which top-K index set), TOPK_FKL_K=<int>.
-TOPK_FKL_RESPONSE=${TOPK_FKL_RESPONSE:-False}
-TOPK_FKL_REJECT=${TOPK_FKL_REJECT:-False}
-TOPK_FKL_MODE=${TOPK_FKL_MODE:-teacher}
-TOPK_FKL_K=${TOPK_FKL_K:-64}
-# Student-side top-K for union/student support. 0 = reuse TOPK_FKL_K (same K for teacher & student).
-# Set != TOPK_FKL_K for an asymmetric union, e.g. TOPK_FKL_MODE=union TOPK_FKL_K=64 TOPK_FKL_STUDENT_K=8.
+# draftopd per-region loss selection. The response stream splits into response (accepted tokens) and
+# reject-accept (the corrected token y at SD reject positions); the reject stream splits into reject-token
+# (first mismatch d, min offset per anchor) and post-reject (the discarded suffix). Defaults below reproduce
+# original draftopd (response/reject-accept = Bernoulli forward KL; reject-token/post-reject = reverse KL).
+#   *_LOSS_MODE forward regions: bernoulli_fkl | topk_fkl ; reject regions: reverse_kl | topk_fkl
+#   Top-K forward KL is the in-model FKL over the teacher/student top-K. TOPK_FKL_TEACHER_K and
+#   TOPK_FKL_STUDENT_K: both > 0 -> union; only one > 0 -> that side (teacher-only is the original).
+RESPONSE_LOSS_MODE=${RESPONSE_LOSS_MODE:-bernoulli_fkl}
+REJECT_ACCEPT_LOSS_MODE=${REJECT_ACCEPT_LOSS_MODE:-bernoulli_fkl}
+REJECT_TOKEN_LOSS_MODE=${REJECT_TOKEN_LOSS_MODE:-reverse_kl}
+POST_REJECT_LOSS_MODE=${POST_REJECT_LOSS_MODE:-reverse_kl}
+TOPK_FKL_TEACHER_K=${TOPK_FKL_TEACHER_K:-64}
 TOPK_FKL_STUDENT_K=${TOPK_FKL_STUDENT_K:-0}
 DFLASH_LM_HEAD_CHUNK_SIZE=${DFLASH_LM_HEAD_CHUNK_SIZE:-512}
 TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.2}
@@ -92,14 +77,18 @@ exec bash "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     ++actor_rollout_ref.model.override_config.verl_dflash_rejected_draft_reverse_enabled="${REJECTED_DRAFT_REVERSE}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_enabled="${RANDOM_RESPONSE_ANCHOR_ENABLED}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_seed="${RANDOM_RESPONSE_ANCHOR_SEED}" \
-    ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_response_enabled="${TOPK_FKL_RESPONSE}" \
-    ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_reject_enabled="${TOPK_FKL_REJECT}" \
-    ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_mode="${TOPK_FKL_MODE}" \
-    ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_k="${TOPK_FKL_K}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_response_loss_mode="${RESPONSE_LOSS_MODE}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_reject_accept_loss_mode="${REJECT_ACCEPT_LOSS_MODE}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_reject_token_loss_mode="${REJECT_TOKEN_LOSS_MODE}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_post_reject_loss_mode="${POST_REJECT_LOSS_MODE}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_teacher_k="${TOPK_FKL_TEACHER_K}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_topk_fkl_student_k="${TOPK_FKL_STUDENT_K}" \
-    distillation.distillation_loss.topk_fkl_response_enabled="${TOPK_FKL_RESPONSE}" \
-    distillation.distillation_loss.topk_fkl_reject_enabled="${TOPK_FKL_REJECT}" \
-    distillation.distillation_loss.corrected_token_only="${CORRECTED_TOKEN_ONLY}" \
+    distillation.distillation_loss.response_loss_mode="${RESPONSE_LOSS_MODE}" \
+    distillation.distillation_loss.reject_accept_loss_mode="${REJECT_ACCEPT_LOSS_MODE}" \
+    distillation.distillation_loss.reject_token_loss_mode="${REJECT_TOKEN_LOSS_MODE}" \
+    distillation.distillation_loss.post_reject_loss_mode="${POST_REJECT_LOSS_MODE}" \
+    distillation.distillation_loss.topk_fkl_teacher_k="${TOPK_FKL_TEACHER_K}" \
+    distillation.distillation_loss.topk_fkl_student_k="${TOPK_FKL_STUDENT_K}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_PROMPT_BSZ}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${STUDENT_MAX_TOKEN_LEN_PER_GPU}" \
@@ -117,7 +106,6 @@ exec bash "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     distillation.distillation_loss.loss_mode="${DISTILLATION_LOSS_MODE}" \
     distillation.distillation_loss.reverse_kl_weight="${REVERSE_KL_WEIGHT}" \
     distillation.distillation_loss.forward_kl_weight="${FORWARD_KL_WEIGHT}" \
-    distillation.distillation_loss.rejected_draft_use_reverse_kl="${REJECTED_DRAFT_USE_REVERSE_KL}" \
     distillation.distillation_loss.response_stream_weight="${stream_weight}" \
     distillation.distillation_loss.rejected_draft_stream_weight="${rejected_draft_stream_weight}" \
     distillation.distillation_loss.rejected_draft_position_decay_enabled="${REJECTED_DRAFT_POSITION_DECAY_ENABLED}" \
