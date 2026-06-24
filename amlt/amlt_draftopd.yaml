@@ -173,9 +173,11 @@ jobs:
       - export VAL_DIR=$${VAL_DIR:-$${AMLT_CODE_DIR}/data_prep/val}
       - export VAL_FILES="['$${VAL_DIR}/aime24.jsonl','$${VAL_DIR}/gsm8k.jsonl','$${VAL_DIR}/math500.jsonl','$${VAL_DIR}/mbpp.jsonl']"
       - 'test -f "$${TRAIN_JSONL}" || { echo "[ERR] bundled pool missing (data_prep/opd_pool_16k.jsonl not uploaded?): $${TRAIN_JSONL}"; exit 1; }'
-      # ---- Pre-cache HF models once (best-effort; trainer downloads on demand otherwise) ----
-      - hf download "${MAIN_MODEL_PATH}" >/dev/null 2>&1 || true
-      - hf download "${DRAFT_MODEL_PATH}" >/dev/null 2>&1 || true
+      # ---- Pre-cache HF models with RETRIES (a transient HF blip during SGLang's on-demand draft download
+      #      crashes the scheduler; the old best-effort '|| true' silently hid a partial download, leaving an
+      #      incomplete blob HF_HOME snapshot that SGLang re-fetches). Once the cache is fully populated the
+      #      load hits the local snapshot first (no network); HF still downloads on a genuine cache miss. ----
+      - 'for m in "$${MAIN_MODEL_PATH}" "$${DRAFT_MODEL_PATH}"; do for i in 1 2 3 4 5 6; do hf download "$$m" >/dev/null 2>&1 && break; echo "[hf] download retry $$i/6 for $$m"; sleep $$(( i * 20 )); done; done'
       # ---- Hydrate: pull ONLY the latest blob checkpoint back to local so RESUME_MODE=auto resumes
       #      (the trainer only looks at LOCAL_CKPT; local is empty on a fresh node). ----
       - 'mkdir -p "$${LOCAL_CKPT}" "$${BLOB_CKPT}"; if [ -f "$${BLOB_CKPT}/latest_checkpointed_iteration.txt" ]; then s=$$(cat "$${BLOB_CKPT}/latest_checkpointed_iteration.txt"); echo "[ckpt] hydrate global_step_$${s} blob->local"; cp -r "$${BLOB_CKPT}/global_step_$${s}" "$${LOCAL_CKPT}/" 2>/dev/null || true; cp "$${BLOB_CKPT}/latest_checkpointed_iteration.txt" "$${LOCAL_CKPT}/" 2>/dev/null || true; fi'
