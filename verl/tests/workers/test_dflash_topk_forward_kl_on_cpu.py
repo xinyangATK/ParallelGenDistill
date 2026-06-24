@@ -19,6 +19,7 @@ from verl.trainer.distillation.losses import (
     distillation_loss,
 )
 from verl.trainer.ppo.core_algos import kl_penalty
+from verl.workers.config.distillation import DistillationLossConfig
 from verl.workers.utils.padding import no_padding_2_padding
 
 
@@ -172,6 +173,61 @@ def test_topk_tv_grad_flows_through_student_only():
     assert touched[0, 1] and touched[0, 3] and touched[1, 2]
 
 
+def _manual_topk_reverse_kl(draft_hidden, teacher_logits, out, b, d, r, mode, k, k_student=None):
+    k_student = k if k_student is None else k_student
+    s_logits = out(draft_hidden[b, d, :]).float()
+    s_lp = F.log_softmax(s_logits, dim=-1)
+    s_p = s_lp.exp()
+    t_logits = teacher_logits[b, r, :].float()
+    t_lp = F.log_softmax(t_logits, dim=-1)
+    sel = torch.zeros_like(s_lp, dtype=torch.bool)
+    if mode in ("teacher", "union"):
+        sel.scatter_(-1, t_logits.topk(k, dim=-1).indices, True)
+    if mode in ("student", "union"):
+        sel.scatter_(-1, s_logits.topk(k_student, dim=-1).indices, True)
+    return (s_p * (s_lp - t_lp) * sel).sum(dim=-1).clamp_min(0.0)
+
+
+def _call_rkl(student, draft_hidden, teacher_logits, out, b, d, r, *, mode, k=2, k_student=None, chunk_size=64):
+    return student._compute_topk_reverse_kl(
+        draft_hidden=draft_hidden, output_embeddings=out, batch_indices=b, draft_indices=d,
+        teacher_logits=teacher_logits, row_indices=r, chunk_size=chunk_size, mode=mode,
+        topk_teacher=k, topk_student=k if k_student is None else k_student,
+    )
+
+
+def test_topk_reverse_kl_matches_manual_each_mode():
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    draft_hidden, teacher_logits, out, b, d, r, _ = _make_inputs()
+    for mode in ("teacher", "student", "union"):
+        rkl, _ = _call_rkl(student, draft_hidden, teacher_logits, out, b, d, r, mode=mode, k=2, chunk_size=2)
+        expected = _manual_topk_reverse_kl(draft_hidden, teacher_logits, out, b, d, r, mode, k=2)
+        assert torch.allclose(rkl, expected, atol=1e-6), mode
+        assert rkl.shape == (b.numel(),)
+        assert (rkl >= -1e-6).all()  # clamped to >=0 (partial top-K support)
+
+
+def test_topk_reverse_kl_asymmetric_union_k():
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    draft_hidden, teacher_logits, out, b, d, r, _ = _make_inputs(seed=5)
+    rkl, _ = _call_rkl(student, draft_hidden, teacher_logits, out, b, d, r, mode="union", k=4, k_student=2, chunk_size=2)
+    expected = _manual_topk_reverse_kl(draft_hidden, teacher_logits, out, b, d, r, "union", k=4, k_student=2)
+    assert torch.allclose(rkl, expected, atol=1e-6)
+
+
+def test_topk_reverse_kl_grad_flows_through_student_only():
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    draft_hidden, teacher_logits, out, b, d, r, _ = _make_inputs()
+    draft_hidden.requires_grad_(True)
+    teacher_logits.requires_grad_(True)
+    rkl, _ = _call_rkl(student, draft_hidden, teacher_logits, out, b, d, r, mode="union", k=2, chunk_size=2)
+    assert rkl.requires_grad
+    rkl.sum().backward()
+    assert teacher_logits.grad is None  # teacher term detached (no_grad); reverse KL grad flows through q only
+    # grad reaches the student (per-slot grad may be 0 where clamp_min(0) zeroes a negative partial-support sum).
+    assert draft_hidden.grad is not None and draft_hidden.grad.abs().sum() > 0
+
+
 def test_collect_rejected_draft_topk_fkl_uses_realized_teacher_and_drops_oob():
     # Request 2 aligns to draftopd's reject geometry: the SAME rollout-reject slots, only the loss differs.
     # Here block_size K=3 (offsets 1,2), prompt_len=2, response_len=4 (valid_len=6), two block anchors at
@@ -293,6 +349,40 @@ def test_collect_rejected_draft_is_reject_token_min_offset_and_mixed_regions():
         assert teacher_t[0, col] == 0.0
 
 
+def test_collect_rejected_draft_reverse_token_topk_reverse_kl_postreject():
+    # Mixed 3-way routing: reject_token=reverse_kl, post_reject=topk_reverse_kl -> reverse-data slot + two
+    # top-K reverse-KL slots (student channel = the in-model reverse KL vs the realized teacher; teacher 0).
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    torch.manual_seed(2)
+    hidden, vocab, K = 4, 6, 4
+    draft_hidden = torch.randn(1, K, hidden)
+    teacher_logits = torch.randn(1, 7, vocab)
+    out = torch.nn.Linear(hidden, vocab, bias=False)
+    long = lambda v: torch.tensor(v, dtype=torch.long)  # noqa: E731
+    student_t, teacher_t, mask_t, is_rt = student._collect_rejected_draft_log_probs(
+        draft_hidden=draft_hidden, output_embeddings=out, prompt_lengths=long([2]), response_lengths=long([5]),
+        anchor_positions=long([[2]]), block_keep_mask=torch.tensor([[True]]), draft_block_size=K,
+        lm_head_chunk_size=64, max_tokens_per_sample=None,
+        rejected_draft_anchor_indices=long([[0, 0, 0]]), rejected_draft_offsets=long([[1, 2, 3]]),
+        rejected_draft_token_ids=long([[3, 4, 5]]), rejected_draft_teacher_logprobs=torch.tensor([[-0.7, -0.8, -0.9]]),
+        rejected_draft_mask=torch.tensor([[True, True, True]]),
+        reject_token_mode="reverse_kl", post_reject_mode="topk_reverse_kl",
+        teacher_logits=teacher_logits, topk_fkl_mode="teacher", topk_fkl_teacher_k=2,
+    )
+    assert is_rt.tolist() == [[True, False, False]] and mask_t.tolist() == [[True, True, True]]
+    # reject-token (offset 1): reverse data.
+    assert torch.allclose(student_t[0, 0], F.log_softmax(out(draft_hidden[0, 1]).float(), -1)[3], atol=1e-6)
+    assert torch.allclose(teacher_t[0, 0], torch.tensor(-0.7), atol=1e-6)
+    # post-reject (offsets 2,3): top-K REVERSE KL vs teacher rows 3,4; teacher channel 0.
+    for col, (draft_slot, trow) in enumerate([(2, 3), (3, 4)], start=1):
+        exp = _manual_topk_reverse_kl(
+            draft_hidden, teacher_logits, out, torch.tensor([0]), torch.tensor([draft_slot]), torch.tensor([trow]),
+            "teacher", k=2,
+        )
+        assert torch.allclose(student_t[0, col], exp[0], atol=1e-6)
+        assert teacher_t[0, col] == 0.0
+
+
 def _data_one_sample():
     return TensorDict(
         {
@@ -395,6 +485,29 @@ def test_reject_loss_uniform_topk_with_offset_decay_and_slot_count():
     assert torch.allclose(loss, expected, atol=1e-6)
 
 
+def test_reject_loss_uniform_topk_reverse_kl_consumed_directly():
+    # reject_token=post_reject=topk_reverse_kl: the reject loss is the model-emitted reverse-KL value in the
+    # student channel (consumed directly like topk_fkl), decayed by offset and normalized by the slot count.
+    data = _data_one_sample()
+    reject_rkl = torch.tensor([[0.4, 0.6, 0.1]])
+    model_output = {
+        "log_probs": torch.tensor([-0.4, -0.9, -0.3, 0.0]),
+        "opd_loss_mask": torch.tensor([1.0, 1.0, 1.0, 0.0]),
+        "opd_rejected_draft_student_log_probs": reject_rkl,
+        "opd_rejected_draft_teacher_log_probs": torch.zeros_like(reject_rkl),
+        "opd_rejected_draft_loss_mask": torch.ones_like(reject_rkl, dtype=torch.bool),
+        "opd_rejected_draft_offsets": torch.tensor([[1, 2, 3]]),
+        "opd_rejected_draft_is_reject_token": torch.tensor([[True, False, False]]),
+    }
+    decay = 0.5
+    cfg = _reject_cfg("topk_reverse_kl", "topk_reverse_kl", decay)
+    loss, _ = distillation_loss(_reject_config(), SimpleNamespace(distillation_loss=cfg), model_output, data, dp_group=None)
+    fwd = _response_bernoulli(torch.tensor([-0.4, -0.9, -0.3]), torch.tensor([-0.5, -0.7, -0.6]))
+    w = torch.tensor([decay**0, decay**1, decay**2])
+    expected = (fwd.sum() + (w * reject_rkl.squeeze(0)).sum()) / (1.0 * 3.0 + 1.0 * w.sum())
+    assert torch.allclose(loss, expected, atol=1e-6)
+
+
 def test_reject_loss_mixed_reverse_token_topk_postreject():
     # reject_token=reverse_kl, post_reject=topk_fkl: per slot the loss is kl_penalty(log q(d), log p(d)) on
     # the reject-token slot (is_reject_token=True) and the FKL on the post-reject slots, by is_reject_token.
@@ -419,3 +532,19 @@ def test_reject_loss_mixed_reverse_token_topk_postreject():
     w = torch.tensor([decay**0, decay**1, decay**2])
     expected = (fwd.sum() + (w * reject_losses).sum()) / (1.0 * 3.0 + 1.0 * w.sum())
     assert torch.allclose(loss, expected, atol=1e-6)
+
+
+def test_topk_reverse_kl_requires_student_k_for_d_coverage():
+    # topk_reverse_kl needs student_k>0 so the rejected token d (outside the teacher top-K) is in the support;
+    # student_k=0 (teacher-only) would silently train only y, so the config must raise.
+    raised = False
+    try:
+        DistillationLossConfig(reject_token_loss_mode="topk_reverse_kl", topk_fkl_teacher_k=64, topk_fkl_student_k=0)
+    except ValueError:
+        raised = True
+    assert raised, "topk_reverse_kl with student_k=0 must raise"
+    # allowed with student_k>0 (union support covers both y and d); also valid on post_reject.
+    DistillationLossConfig(reject_token_loss_mode="topk_reverse_kl", topk_fkl_teacher_k=8, topk_fkl_student_k=8)
+    DistillationLossConfig(post_reject_loss_mode="topk_reverse_kl", topk_fkl_teacher_k=8, topk_fkl_student_k=8)
+    # default (no topk_reverse_kl) is unaffected even with student_k=0.
+    DistillationLossConfig(topk_fkl_student_k=0)

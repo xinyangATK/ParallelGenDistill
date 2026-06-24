@@ -95,9 +95,11 @@ class DistillationLossConfig(BaseConfig):
     # draftopd per-region loss selection. The response stream splits into the response (accepted) and
     # reject-accept (corrected token y at SD reject positions) regions; the reject stream splits into the
     # reject-token (first mismatch d, min offset per anchor) and post-reject (discarded suffix) regions.
-    # Forward regions choose bernoulli_fkl | topk_fkl | topk_tv; reject regions choose reverse_kl | topk_fkl.
-    # Top-K (forward KL or total-variation) is computed in-model over the teacher/student top-K (both K > 0 ->
-    # union). SEMANTIC OVERLOAD: the top-K value rides in existing channels (response: model_output["log_probs"];
+    # Forward regions choose bernoulli_fkl | topk_fkl | topk_tv; reject regions choose reverse_kl | topk_fkl |
+    # topk_reverse_kl. Top-K losses (forward KL / total-variation / reverse KL) are computed in-model over the
+    # teacher/student top-K (both K > 0 -> union); at a reject position the top-K support holds both the
+    # corrected token y and the rejected token d, so topk_reverse_kl trains both without separating them.
+    # SEMANTIC OVERLOAD: the top-K value rides in existing channels (response: model_output["log_probs"];
     # reject: the student channel). Defaults reproduce original draftopd (response Bernoulli forward, reject
     # reverse KL). Pair each region mode with the matching verl_dflash_*_loss_mode model override.
     response_loss_mode: str = "bernoulli_fkl"
@@ -137,6 +139,15 @@ class DistillationLossConfig(BaseConfig):
             raise ValueError(f"forward_kl_weight must be non-negative, got {self.forward_kl_weight}.")
         if self.loss_mode != "forward_kl_topk" and self.reverse_kl_weight == 0 and self.forward_kl_weight == 0:
             raise ValueError("At least one of reverse_kl_weight or forward_kl_weight must be positive.")
+        if (
+            self.reject_token_loss_mode == "topk_reverse_kl" or self.post_reject_loss_mode == "topk_reverse_kl"
+        ) and self.topk_fkl_student_k <= 0:
+            raise ValueError(
+                "topk_reverse_kl requires topk_fkl_student_k > 0: the rejected token d is a student-top-K token "
+                "generally OUTSIDE the teacher top-K, so with student_k=0 (teacher-only support) the reverse KL "
+                "would train only the corrected token y, not d -- defeating its purpose. Set TOPK_FKL_STUDENT_K > 0 "
+                "(both K > 0 -> union support covering both y and d)."
+            )
         if self.use_policy_gradient and self.forward_kl_weight > 0:
             raise NotImplementedError(
                 "forward_kl_weight > 0 is only supported for direct supervised distillation "

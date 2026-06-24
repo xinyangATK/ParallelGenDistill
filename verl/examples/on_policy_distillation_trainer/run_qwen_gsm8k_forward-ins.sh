@@ -45,7 +45,8 @@ RANDOM_RESPONSE_ANCHOR_SEED=${RANDOM_RESPONSE_ANCHOR_SEED:-42}
 # reject-accept (the corrected token y at SD reject positions); the reject stream splits into reject-token
 # (first mismatch d, min offset per anchor) and post-reject (the discarded suffix). Defaults below reproduce
 # original draftopd (response/reject-accept = Bernoulli forward KL; reject-token/post-reject = reverse KL).
-#   *_LOSS_MODE forward regions: bernoulli_fkl | topk_fkl ; reject regions: reverse_kl | topk_fkl
+#   *_LOSS_MODE forward regions: bernoulli_fkl | topk_fkl | topk_tv ; reject regions: reverse_kl | topk_fkl |
+#   topk_reverse_kl (the last needs TOPK_FKL_STUDENT_K>0 so the rejected token d is in the top-K support).
 #   Top-K forward KL is the in-model FKL over the teacher/student top-K. TOPK_FKL_TEACHER_K and
 #   TOPK_FKL_STUDENT_K: both > 0 -> union; only one > 0 -> that side (teacher-only is the original).
 RESPONSE_LOSS_MODE=${RESPONSE_LOSS_MODE:-bernoulli_fkl}

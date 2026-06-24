@@ -655,11 +655,13 @@ def distillation_loss(
             )
             distillation_metrics.update(rejected_component_metrics)
         else:
-            # draftopd reject stream: per slot reverse KL (kl_penalty on log q(d) vs cached log p(d)) or the
-            # top-K FKL in the student channel, by region (reject-token = is_reject_token). Decay applies below.
-            reject_token_topk = str(getattr(loss_config, "reject_token_loss_mode", "reverse_kl")) == "topk_fkl"
-            post_reject_topk = str(getattr(loss_config, "post_reject_loss_mode", "reverse_kl")) == "topk_fkl"
-            if reject_token_topk and post_reject_topk:
+            # draftopd reject stream: each slot is reverse KL (kl_penalty on log q(d) vs cached log p(d)) or an
+            # in-model top-K loss precomputed in the student channel (topk_fkl / topk_reverse_kl), by region
+            # (reject-token = is_reject_token). Decay applies below.
+            reject_direct_modes = ("topk_fkl", "topk_reverse_kl")
+            reject_token_direct = str(getattr(loss_config, "reject_token_loss_mode", "reverse_kl")) in reject_direct_modes
+            post_reject_direct = str(getattr(loss_config, "post_reject_loss_mode", "reverse_kl")) in reject_direct_modes
+            if reject_token_direct and post_reject_direct:
                 rejected_draft_losses = rejected_student_log_probs.to(dtype=distillation_losses.dtype)
             else:
                 reverse_losses = kl_penalty(
@@ -667,7 +669,7 @@ def distillation_loss(
                     ref_logprob=rejected_teacher_log_probs,
                     kl_penalty=_sampled_kl_loss_mode(loss_config),
                 ).to(dtype=distillation_losses.dtype)
-                if not reject_token_topk and not post_reject_topk:
+                if not reject_token_direct and not post_reject_direct:
                     rejected_draft_losses = reverse_losses
                 else:
                     is_reject_token = model_output.get("opd_rejected_draft_is_reject_token")
@@ -678,11 +680,11 @@ def distillation_loss(
                     is_reject_token = _flatten_nested_tensor(is_reject_token).to(
                         device=rejected_draft_mask.device
                     ).bool()
-                    slot_topk = (is_reject_token & reject_token_topk) | (
-                        is_reject_token.logical_not() & post_reject_topk
+                    slot_direct = (is_reject_token & reject_token_direct) | (
+                        is_reject_token.logical_not() & post_reject_direct
                     )
                     rejected_draft_losses = torch.where(
-                        slot_topk, rejected_student_log_probs.to(dtype=reverse_losses.dtype), reverse_losses
+                        slot_direct, rejected_student_log_probs.to(dtype=reverse_losses.dtype), reverse_losses
                     )
         if loss_config.loss_max_clamp is not None:
             rejected_clamp_fraction = _compute_loss_clamp_fraction(
@@ -757,8 +759,8 @@ def distillation_loss(
                 "opd_rejected_draft_batch_effective_num_tokens"
             )
             reject_is_topk = (
-                str(getattr(loss_config, "reject_token_loss_mode", "reverse_kl")) == "topk_fkl"
-                or str(getattr(loss_config, "post_reject_loss_mode", "reverse_kl")) == "topk_fkl"
+                str(getattr(loss_config, "reject_token_loss_mode", "reverse_kl")) in ("topk_fkl", "topk_reverse_kl")
+                or str(getattr(loss_config, "post_reject_loss_mode", "reverse_kl")) in ("topk_fkl", "topk_reverse_kl")
             )
             if loss_config.onpolicy_reverse_enabled or reject_is_topk:
                 # paradistill / draftopd reject top-K FKL build their own (block, offset) slots (and top-K

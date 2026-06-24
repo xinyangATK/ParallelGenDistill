@@ -36,8 +36,10 @@ DFLASH_ATTENTION_IMPL_IDS = {
     "flex_attention": 2,
 }
 
-# Forward-region loss modes that compute an in-model top-K divergence from the teacher's full-vocab logits.
+# Loss modes that compute an in-model top-K divergence from the teacher's full-vocab logits (need the teacher
+# logits retained). Forward regions: topk_fkl / topk_tv. Reject regions: topk_fkl / topk_reverse_kl.
 _TOPK_FORWARD_MODES = ("topk_fkl", "topk_tv")
+_TOPK_REJECT_MODES = ("topk_fkl", "topk_reverse_kl")
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -403,9 +405,10 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         return int(value)
 
     # Per-region loss-mode getters. Forward regions (response, reject-accept): bernoulli_fkl | topk_fkl |
-    # topk_tv; reject regions (reject-token, post-reject): reverse_kl | topk_fkl. Defaults = original draftopd.
+    # topk_tv; reject regions (reject-token, post-reject): reverse_kl | topk_fkl | topk_reverse_kl.
+    # Defaults = original draftopd.
     _FORWARD_REGION_MODES = ("bernoulli_fkl", "topk_fkl", "topk_tv")
-    _REJECT_REGION_MODES = ("reverse_kl", "topk_fkl")
+    _REJECT_REGION_MODES = ("reverse_kl", "topk_fkl", "topk_reverse_kl")
 
     def _get_region_loss_mode(self, config_key: str, env_key: str, default: str, allowed: tuple) -> str:
         value = getattr(self.config, config_key, None)
@@ -636,6 +639,32 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             torch.cat(sample_chunks, dim=0),
         )
 
+    @staticmethod
+    def _topk_candidate_support(student_logits, teacher_chunk_logits, mode, topk_teacher, topk_student):
+        """Top-K support ``S`` as gathered candidate columns: returns ``(cand_idx, keep_bool)``.
+
+        ``S`` = the teacher top-``topk_teacher`` and/or student top-``topk_student`` tokens (``mode``);
+        ``union`` dedups student columns already in the teacher top-K (``keep`` zeros them) so each token
+        in ``S`` contributes once. Grad-free (detached indices); call under no_grad. Shared by the top-K
+        forward-KL / TV / reverse-KL helpers.
+        """
+        index_parts: list[torch.Tensor] = []
+        keep_parts: list[torch.Tensor] = []
+        teacher_idx = None
+        if mode in ("teacher", "union"):
+            teacher_idx = teacher_chunk_logits.topk(topk_teacher, dim=-1).indices  # (n, K_t)
+            index_parts.append(teacher_idx)
+            keep_parts.append(torch.ones_like(teacher_idx, dtype=torch.bool))
+        if mode in ("student", "union"):
+            student_idx = student_logits.detach().topk(topk_student, dim=-1).indices  # (n, K_s)
+            index_parts.append(student_idx)
+            if teacher_idx is None:
+                keep_parts.append(torch.ones_like(student_idx, dtype=torch.bool))
+            else:
+                dup = (student_idx.unsqueeze(-1) == teacher_idx.unsqueeze(-2)).any(dim=-1)  # (n, K_s)
+                keep_parts.append(~dup)
+        return torch.cat(index_parts, dim=-1), torch.cat(keep_parts, dim=-1)
+
     def _compute_topk_forward_kl(
         self,
         *,
@@ -682,25 +711,10 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             with torch.no_grad():
                 teacher_chunk_logits = teacher_logits[batch_indices[start:end], row_indices[start:end], :].float()
                 teacher_lse = torch.logsumexp(teacher_chunk_logits, dim=-1, keepdim=True)  # (n, 1)
-                # Candidate support S = (teacher top-K) U (student top-K) by mode, gathered -- not masked.
-                index_parts: list[torch.Tensor] = []
-                keep_parts: list[torch.Tensor] = []
-                teacher_idx = None
-                if mode in ("teacher", "union"):
-                    teacher_idx = teacher_chunk_logits.topk(topk_teacher, dim=-1).indices  # (n, K_t)
-                    index_parts.append(teacher_idx)
-                    keep_parts.append(torch.ones_like(teacher_idx, dtype=torch.bool))
-                if mode in ("student", "union"):
-                    student_idx = student_logits.detach().topk(topk_student, dim=-1).indices  # (n, K_s)
-                    index_parts.append(student_idx)
-                    if teacher_idx is None:
-                        keep_parts.append(torch.ones_like(student_idx, dtype=torch.bool))
-                    else:
-                        # union dedup: drop student columns whose token is already in the teacher top-K.
-                        dup = (student_idx.unsqueeze(-1) == teacher_idx.unsqueeze(-2)).any(dim=-1)  # (n, K_s)
-                        keep_parts.append(~dup)
-                cand_idx = torch.cat(index_parts, dim=-1)  # (n, |S_cand|)
-                keep = torch.cat(keep_parts, dim=-1).to(teacher_chunk_logits.dtype)  # (n, |S_cand|)
+                cand_idx, keep = self._topk_candidate_support(
+                    student_logits, teacher_chunk_logits, mode, topk_teacher, topk_student
+                )
+                keep = keep.to(teacher_chunk_logits.dtype)  # (n, |S_cand|)
                 teacher_logp_sel = teacher_chunk_logits.gather(-1, cand_idx) - teacher_lse  # log p_t over S
                 teacher_probs_sel = teacher_logp_sel.exp()
             student_logp_sel = student_log_probs.gather(-1, cand_idx)  # log q_s over S (keeps grad)
@@ -751,23 +765,10 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             with torch.no_grad():
                 teacher_chunk_logits = teacher_logits[batch_indices[start:end], row_indices[start:end], :].float()
                 teacher_lse = torch.logsumexp(teacher_chunk_logits, dim=-1, keepdim=True)
-                index_parts: list[torch.Tensor] = []
-                keep_parts: list[torch.Tensor] = []
-                teacher_idx = None
-                if mode in ("teacher", "union"):
-                    teacher_idx = teacher_chunk_logits.topk(topk_teacher, dim=-1).indices
-                    index_parts.append(teacher_idx)
-                    keep_parts.append(torch.ones_like(teacher_idx, dtype=torch.bool))
-                if mode in ("student", "union"):
-                    student_idx = student_logits.detach().topk(topk_student, dim=-1).indices
-                    index_parts.append(student_idx)
-                    if teacher_idx is None:
-                        keep_parts.append(torch.ones_like(student_idx, dtype=torch.bool))
-                    else:
-                        dup = (student_idx.unsqueeze(-1) == teacher_idx.unsqueeze(-2)).any(dim=-1)
-                        keep_parts.append(~dup)
-                cand_idx = torch.cat(index_parts, dim=-1)  # (n, |S_cand|)
-                keep = torch.cat(keep_parts, dim=-1).to(teacher_chunk_logits.dtype)
+                cand_idx, keep = self._topk_candidate_support(
+                    student_logits, teacher_chunk_logits, mode, topk_teacher, topk_student
+                )
+                keep = keep.to(teacher_chunk_logits.dtype)
                 teacher_probs_sel = (teacher_chunk_logits.gather(-1, cand_idx) - teacher_lse).exp()  # p_t over S
             student_probs_sel = (student_logits.gather(-1, cand_idx) - student_lse).exp()  # q_s over S (keeps grad)
             tv = (0.5 * (teacher_probs_sel - student_probs_sel).abs() * keep).sum(dim=-1)
@@ -778,6 +779,63 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
 
         selected_entropy = torch.cat(entropy_chunks, dim=0) if calculate_entropy else None
         return torch.cat(tv_chunks, dim=0), selected_entropy
+
+    def _compute_topk_reverse_kl(
+        self,
+        *,
+        draft_hidden: torch.Tensor,
+        output_embeddings: torch.nn.Module,
+        batch_indices: torch.LongTensor,
+        draft_indices: torch.LongTensor,
+        teacher_logits: torch.Tensor,
+        row_indices: torch.LongTensor,
+        chunk_size: int,
+        mode: str,
+        topk_teacher: int,
+        topk_student: int,
+        calculate_entropy: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Per-slot top-K reverse KL ``sum_{v in S} q_s(v) (log q_s(v) - log p_t(v))``.
+
+        Reverse-direction analog of ``_compute_topk_forward_kl`` over the SAME support ``S`` (``mode``/
+        ``topk_*``; teacher at ``row_indices`` under no_grad). Gradient flows through ``q_s`` in BOTH the
+        weight ``q_s(v)`` and ``log q_s(v)``. ``q_s, p_t`` are full-vocab softmax via logsumexp+gather (no
+        full-vocab softmax materialized). The partial-support sum is clamped to >=0 (top-K mass < 1). At a
+        reject position the top-K support contains both the corrected token y (teacher mode) and the rejected
+        token d (student mode), so one reverse KL trains both without separating them.
+        """
+        if batch_indices.numel() == 0:
+            empty = draft_hidden.new_empty((0,), dtype=torch.float32)
+            return empty, (empty if calculate_entropy else None)
+
+        selected_hidden = draft_hidden[batch_indices, draft_indices, :]
+        rkl_chunks: list[torch.Tensor] = []
+        entropy_chunks: list[torch.Tensor] = []
+        vocab_size = int(teacher_logits.shape[-1])
+        topk_teacher = min(int(topk_teacher), vocab_size)
+        topk_student = min(int(topk_student), vocab_size)
+        for start in range(0, selected_hidden.shape[0], chunk_size):
+            end = min(start + chunk_size, selected_hidden.shape[0])
+            student_logits = output_embeddings(selected_hidden[start:end]).float()
+            student_lse = torch.logsumexp(student_logits, dim=-1, keepdim=True)  # (n, 1); grad to all logits
+            with torch.no_grad():
+                teacher_chunk_logits = teacher_logits[batch_indices[start:end], row_indices[start:end], :].float()
+                teacher_lse = torch.logsumexp(teacher_chunk_logits, dim=-1, keepdim=True)
+                cand_idx, keep = self._topk_candidate_support(
+                    student_logits, teacher_chunk_logits, mode, topk_teacher, topk_student
+                )
+                keep = keep.to(teacher_chunk_logits.dtype)
+                teacher_logp_sel = teacher_chunk_logits.gather(-1, cand_idx) - teacher_lse  # log p_t over S
+            student_logp_sel = student_logits.gather(-1, cand_idx) - student_lse  # log q_s over S (keeps grad)
+            student_probs_sel = student_logp_sel.exp()  # q_s over S (grad through the weight too)
+            rkl = (student_probs_sel * (student_logp_sel - teacher_logp_sel) * keep).sum(dim=-1).clamp_min(0.0)
+            rkl_chunks.append(rkl)
+            if calculate_entropy:
+                student_log_probs = F.log_softmax(student_logits, dim=-1)
+                entropy_chunks.append(-(student_log_probs.exp() * student_log_probs).sum(dim=-1))
+
+        selected_entropy = torch.cat(entropy_chunks, dim=0) if calculate_entropy else None
+        return torch.cat(rkl_chunks, dim=0), selected_entropy
 
     def _build_random_response_anchor_plan(
         self,
@@ -1169,7 +1227,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         teacher_tensor = draft_hidden.new_zeros((batch_size, rejected_width), dtype=torch.float32)
         mask_tensor = torch.zeros((batch_size, rejected_width), dtype=torch.bool, device=draft_hidden.device)
         is_reject_token_tensor = torch.zeros((batch_size, rejected_width), dtype=torch.bool, device=draft_hidden.device)
-        any_topk = reject_token_mode == "topk_fkl" or post_reject_mode == "topk_fkl"
+        any_topk = reject_token_mode in _TOPK_REJECT_MODES or post_reject_mode in _TOPK_REJECT_MODES
         any_reverse = reject_token_mode == "reverse_kl" or post_reject_mode == "reverse_kl"
         if (
             rejected_draft_anchor_indices is None
@@ -1229,28 +1287,30 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 if prev is None or offset < prev:
                     min_offset_by_anchor[batch_idx][full_anchor] = offset
 
-        # Pass 2: route each slot to reverse-KL data or the realized-teacher top-K FKL by its region's mode.
+        # Pass 2: route each slot by its region's mode -> reverse-KL data (log q(d) + cached log p(d)), or
+        # an in-model top-K forward KL / top-K reverse KL at the realized teacher position. Both top-K modes
+        # ride in the student channel (teacher channel 0) and drop slots whose realized target is OOB.
         rev_batch: list[int] = []
         rev_draft: list[int] = []
         rev_tokens: list[int] = []
         rev_items: list[tuple[int, int]] = []
         rev_teacher: list[float] = []
-        topk_batch: list[int] = []
-        topk_draft: list[int] = []
-        topk_rows: list[int] = []
-        topk_items: list[tuple[int, int]] = []
+        # one (batch, draft, rows, items) bucket per top-K mode keyed by the in-model helper.
+        topk_fns = {"topk_fkl": self._compute_topk_forward_kl, "topk_reverse_kl": self._compute_topk_reverse_kl}
+        topk_buckets = {m: {"batch": [], "draft": [], "rows": [], "items": []} for m in topk_fns}
         for batch_idx, item_idx, block_idx, offset, token_id, full_anchor, valid_len in candidates:
             is_reject_token = offset == min_offset_by_anchor[batch_idx][full_anchor]
             mode = reject_token_mode if is_reject_token else post_reject_mode
             draft_index = block_idx * draft_block_size + offset
-            if mode == "topk_fkl":
+            if mode in topk_buckets:
                 if full_anchor + offset >= valid_len:
                     continue  # realized teacher target past the response end
-                topk_batch.append(batch_idx)
-                topk_draft.append(draft_index)
-                topk_rows.append(full_anchor + offset - 1)
-                topk_items.append((batch_idx, item_idx))
-            else:
+                bucket = topk_buckets[mode]
+                bucket["batch"].append(batch_idx)
+                bucket["draft"].append(draft_index)
+                bucket["rows"].append(full_anchor + offset - 1)
+                bucket["items"].append((batch_idx, item_idx))
+            else:  # reverse_kl
                 rev_batch.append(batch_idx)
                 rev_draft.append(draft_index)
                 rev_tokens.append(token_id)
@@ -1278,20 +1338,22 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             teacher_tensor[rev_rows, rev_cols] = torch.tensor(
                 rev_teacher, dtype=torch.float32, device=draft_hidden.device
             )
-        if topk_batch:
-            topk_values, _ = self._compute_topk_forward_kl(
+        for mode, bucket in topk_buckets.items():
+            if not bucket["batch"]:
+                continue
+            values, _ = topk_fns[mode](
                 draft_hidden=draft_hidden,
                 output_embeddings=output_embeddings,
-                batch_indices=_long(topk_batch),
-                draft_indices=_long(topk_draft),
+                batch_indices=_long(bucket["batch"]),
+                draft_indices=_long(bucket["draft"]),
                 teacher_logits=teacher_logits,
-                row_indices=_long(topk_rows),
+                row_indices=_long(bucket["rows"]),
                 chunk_size=lm_head_chunk_size,
                 mode=topk_fkl_mode,
                 topk_teacher=topk_fkl_teacher_k,
                 topk_student=topk_fkl_student_k,
             )
-            student_tensor[_long([b for b, _ in topk_items]), _long([c for _, c in topk_items])] = topk_values
+            student_tensor[_long([b for b, _ in bucket["items"]]), _long([c for _, c in bucket["items"]])] = values
         return student_tensor, teacher_tensor, mask_tensor, is_reject_token_tensor
 
     def _run_dflash_draft_forward(
@@ -1438,10 +1500,11 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         reject_accept_loss_mode = self._get_reject_accept_loss_mode()
         reject_token_loss_mode = self._get_reject_token_loss_mode()
         post_reject_loss_mode = self._get_post_reject_loss_mode()
-        reject_token_topk = reject_token_loss_mode == "topk_fkl"
-        post_reject_topk = post_reject_loss_mode == "topk_fkl"
-        # A region "uses top-K" (needs the teacher's full-vocab logits + a top-K helper) when its mode is a
-        # top-K forward divergence: forward regions support topk_fkl / topk_tv, reject regions topk_fkl.
+        reject_token_topk = reject_token_loss_mode in _TOPK_REJECT_MODES
+        post_reject_topk = post_reject_loss_mode in _TOPK_REJECT_MODES
+        # A region "uses top-K" (needs the teacher's full-vocab logits + an in-model top-K helper) when its
+        # mode is a top-K divergence: forward regions topk_fkl / topk_tv, reject regions topk_fkl /
+        # topk_reverse_kl.
         topk_enabled = (
             response_loss_mode in _TOPK_FORWARD_MODES
             or reject_accept_loss_mode in _TOPK_FORWARD_MODES
@@ -1512,12 +1575,21 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             )
         if (reject_token_topk or post_reject_topk) and response_anchor_mode != "reject":
             raise NotImplementedError(
-                "draftopd reject-region top-K forward KL (reject_token/post_reject loss_mode=topk_fkl) "
-                "requires reject-mode anchors."
+                "draftopd reject-region top-K losses (reject_token/post_reject loss_mode=topk_fkl|topk_reverse_kl) "
+                "require reject-mode anchors."
             )
         topk_fkl_teacher_k = self._get_topk_fkl_teacher_k() if topk_enabled else 0
         topk_fkl_student_k = self._get_topk_fkl_student_k() if topk_enabled else 0
         topk_fkl_mode = self._resolve_topk_fkl_mode(topk_fkl_teacher_k, topk_fkl_student_k) if topk_enabled else "teacher"
+        if (
+            reject_token_loss_mode == "topk_reverse_kl" or post_reject_loss_mode == "topk_reverse_kl"
+        ) and topk_fkl_student_k <= 0:
+            # The rejected token d is a student-top-K token generally outside the teacher top-K, so teacher-only
+            # support would train only the corrected token y. Require student support so S covers both y and d.
+            raise ValueError(
+                "topk_reverse_kl requires verl_dflash_topk_fkl_student_k > 0 (union support); with student_k=0 "
+                "the top-K support is teacher-only and excludes the rejected token d."
+            )
         split_random_rejected_pass = random_response_anchor_enabled
         # The rollout-reject stream exists only for reject-mode anchors (draftopd); free anchors (paradistill)
         # have none. verl_dflash_rejected_draft_reverse_enabled=False skips the whole reject-stream compute

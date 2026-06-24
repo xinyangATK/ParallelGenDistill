@@ -69,16 +69,18 @@ env_defaults:
   # the response forward KL. Override at submit: REJECTED_DRAFT_REVERSE=False amlt run ... --yes
   REJECTED_DRAFT_REVERSE: True
   # ---- Per-region loss selection. Response stream: RESPONSE_LOSS_MODE (accepted tokens) +
-  #      REJECT_ACCEPT_LOSS_MODE (corrected token y) in {bernoulli_fkl, topk_fkl}. Reject stream:
+  #      REJECT_ACCEPT_LOSS_MODE (corrected token y) in {bernoulli_fkl, topk_fkl, topk_tv}. Reject stream:
   #      REJECT_TOKEN_LOSS_MODE (first mismatch d) + POST_REJECT_LOSS_MODE (discarded suffix) in
-  #      {reverse_kl, topk_fkl}. Defaults below reproduce original draftopd. Top-K is the in-model forward KL
-  #      over teacher/student top-K; TOPK_FKL_TEACHER_K & TOPK_FKL_STUDENT_K both > 0 -> union. ----
+  #      {reverse_kl, topk_fkl, topk_reverse_kl}. Defaults below reproduce original draftopd. Top-K losses are
+  #      in-model over teacher/student top-K; TOPK_FKL_TEACHER_K & TOPK_FKL_STUDENT_K both > 0 -> union.
+  #      topk_reverse_kl at a reject position covers both y and d (set response_stream_weight=0 -> reject only). ----
   RESPONSE_LOSS_MODE: bernoulli_fkl
   REJECT_ACCEPT_LOSS_MODE: bernoulli_fkl
   REJECT_TOKEN_LOSS_MODE: reverse_kl
   POST_REJECT_LOSS_MODE: reverse_kl
   TOPK_FKL_TEACHER_K: 8        # teacher-side top-K (0 disables the teacher support)
-  TOPK_FKL_STUDENT_K: 8         # student-side top-K (0 disables; both > 0 -> union)
+  TOPK_FKL_STUDENT_K: 8         # student-side top-K (0 disables; both > 0 -> union). REQUIRED > 0 for topk_reverse_kl.
+  RESPONSE_STREAM_WEIGHT: 1.0   # response-stream weight; set 0 to train ONLY reject positions
   # Reject-stream per-offset weighting: weight each rejected/FKL slot by DECAY^(offset-1) (offset = draft
   # head depth). Applies to BOTH the baseline reverse stream and the Request 2 top-K FKL. ENABLED=False ->
   # uniform weights. Matches the launcher defaults (True / 0.8); set here to make them tunable at submit.
@@ -159,6 +161,7 @@ jobs:
       - export POST_REJECT_LOSS_MODE=${POST_REJECT_LOSS_MODE}
       - export TOPK_FKL_TEACHER_K=${TOPK_FKL_TEACHER_K}
       - export TOPK_FKL_STUDENT_K=${TOPK_FKL_STUDENT_K}
+      - export stream_weight=${RESPONSE_STREAM_WEIGHT}
       - export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED}
       - export REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY}
       - export train_epochs=${train_epochs}
