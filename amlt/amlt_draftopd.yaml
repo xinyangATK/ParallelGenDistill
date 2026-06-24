@@ -54,10 +54,16 @@ env_defaults:
   DISTILLATION_LOSS_MODE: k3
   FORWARD_KL_WEIGHT: 1.0
   REVERSE_KL_WEIGHT: 0.0
-  # Auto-resume from the latest checkpoint on the blob (disable | auto | resume_path). Safe on a fresh
-  # run. Re-submitting the SAME experiment name continues from the last global_step_*; the frozen
-  # main_model is rebuilt from HF. Set RESUME_MODE=disable to force from-scratch.
+  # Auto-resume from the latest checkpoint (disable | auto | resume_path). Safe on a fresh run.
+  # Re-submitting the SAME experiment name continues from the last global_step_* (hydrated blob->local
+  # below); the frozen main_model is rebuilt from HF. Set RESUME_MODE=disable to force from-scratch.
   RESUME_MODE: auto
+  # ---- Checkpoint storage: the trainer writes to node-local FAST disk (LOCAL_CKPT_ROOT) and a background
+  #      loop mirrors to the durable blob copy. Saving FSDP shards straight to blob-fuse is slow and the
+  #      post-save distributed barrier (nccl_timeout) can crash the job. See docs/checkpoint_local_to_blob.md.
+  LOCAL_CKPT_ROOT: /tmp        # node-local fast disk root (override if /tmp is tmpfs / too small)
+  CKPT_MIRROR_INTERVAL: 300    # seconds between local->blob mirror passes
+  MAX_LOCAL_CKPT_KEEP: 2       # keep last N checkpoints on LOCAL disk (blob keeps the full history)
   # True (default) = original draftopd (reverse KL on the rejected draft token). Set False for a
   # FORWARD-ONLY draftopd: skip the reverse stream in the model (no reverse softmax / OOM), train only
   # the response forward KL. Override at submit: REJECTED_DRAFT_REVERSE=False amlt run ... --yes
@@ -71,8 +77,8 @@ env_defaults:
   REJECT_ACCEPT_LOSS_MODE: bernoulli_fkl
   REJECT_TOKEN_LOSS_MODE: reverse_kl
   POST_REJECT_LOSS_MODE: reverse_kl
-  TOPK_FKL_TEACHER_K: 64        # teacher-side top-K (0 disables the teacher support)
-  TOPK_FKL_STUDENT_K: 0         # student-side top-K (0 disables; both > 0 -> union)
+  TOPK_FKL_TEACHER_K: 8        # teacher-side top-K (0 disables the teacher support)
+  TOPK_FKL_STUDENT_K: 8         # student-side top-K (0 disables; both > 0 -> union)
   # Reject-stream per-offset weighting: weight each rejected/FKL slot by DECAY^(offset-1) (offset = draft
   # head depth). Applies to BOTH the baseline reverse stream and the Request 2 top-K FKL. ENABLED=False ->
   # uniform weights. Matches the launcher defaults (True / 0.8); set here to make them tunable at submit.
@@ -117,7 +123,12 @@ jobs:
       - export AZURE_STORAGE_ROOT=$${AZURE_STORAGE_ROOT:-/blob/t-xinyangliu}
       - export OUTPUT_ROOT=$${OUTPUT_ROOT:-$${AZURE_STORAGE_ROOT}/outputs/$${AMLT_JOB_NAME}/$${AMLT_EXPERIMENT_NAME}}
       - export HF_HOME=$${HF_HOME:-$${AZURE_STORAGE_ROOT}/cache/hf}
-      - export CKPT_DIR=$${CKPT_DIR:-$${OUTPUT_ROOT}/checkpoints}
+      # ---- Checkpoints: trainer writes to node-local fast disk (LOCAL_CKPT = CKPT_DIR =
+      #      trainer.default_local_dir); a background loop (below) mirrors to the durable blob copy
+      #      (BLOB_CKPT). See docs/checkpoint_local_to_blob.md. ----
+      - export BLOB_CKPT=$${BLOB_CKPT:-$${OUTPUT_ROOT}/checkpoints}
+      - export LOCAL_CKPT=$${LOCAL_CKPT:-${LOCAL_CKPT_ROOT}/draftopd_ckpt/$${AMLT_EXPERIMENT_NAME:-default}}
+      - export CKPT_DIR=$${LOCAL_CKPT}
       - export WANDB_DIR=$${WANDB_DIR:-$${OUTPUT_ROOT}/wandb}
       # ---- W&B key (kept off the public repo; offline by default — see header note #3) ----
       - set +x 2>/dev/null; source $${AZURE_STORAGE_ROOT}/secret/wandb_key.sh 2>/dev/null || true
@@ -159,8 +170,15 @@ jobs:
       # ---- Pre-cache HF models once (best-effort; trainer downloads on demand otherwise) ----
       - hf download "${MAIN_MODEL_PATH}" >/dev/null 2>&1 || true
       - hf download "${DRAFT_MODEL_PATH}" >/dev/null 2>&1 || true
-      # ---- Run ----
-      - bash verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh "data.val_files=$${VAL_FILES}"
+      # ---- Hydrate: pull ONLY the latest blob checkpoint back to local so RESUME_MODE=auto resumes
+      #      (the trainer only looks at LOCAL_CKPT; local is empty on a fresh node). ----
+      - 'mkdir -p "$${LOCAL_CKPT}" "$${BLOB_CKPT}"; if [ -f "$${BLOB_CKPT}/latest_checkpointed_iteration.txt" ]; then s=$$(cat "$${BLOB_CKPT}/latest_checkpointed_iteration.txt"); echo "[ckpt] hydrate global_step_$${s} blob->local"; cp -r "$${BLOB_CKPT}/global_step_$${s}" "$${LOCAL_CKPT}/" 2>/dev/null || true; cp "$${BLOB_CKPT}/latest_checkpointed_iteration.txt" "$${LOCAL_CKPT}/" 2>/dev/null || true; fi'
+      # ---- Run with a background local->blob mirror, then stop it + final-flush, preserving the TRAINING
+      #      exit code. sync_blob is additive (never --delete) and copies global_step_* BEFORE the tracker so
+      #      blob's tracker never points at a half-copied checkpoint; '|| true' keeps the loop alive through
+      #      transient copy errors / checkpoint rotation. Mirror + train + flush are ONE shell item so the
+      #      background PID lifecycle is self-contained. ----
+      - 'sync_blob() { cp -ru "$${LOCAL_CKPT}"/global_step_* "$${BLOB_CKPT}/" 2>/dev/null || true; cp -u "$${LOCAL_CKPT}"/latest_checkpointed_iteration.txt "$${BLOB_CKPT}/" 2>/dev/null || true; }; set -m; ( while true; do sync_blob; sleep ${CKPT_MIRROR_INTERVAL}; done ) & CKPT_SYNC_PID=$$!; set +m; if bash verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh "data.val_files=$${VAL_FILES}" "trainer.max_actor_ckpt_to_keep=${MAX_LOCAL_CKPT_KEEP}"; then rc=0; else rc=$$?; fi; kill -- -$${CKPT_SYNC_PID} 2>/dev/null || true; sync_blob; exit $${rc}'
     submit_args:
       env:
         DATASET_MOUNT_BLOCK_BASED_CACHE_ENABLED: True

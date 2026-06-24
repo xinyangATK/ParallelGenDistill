@@ -95,11 +95,11 @@ class DistillationLossConfig(BaseConfig):
     # draftopd per-region loss selection. The response stream splits into the response (accepted) and
     # reject-accept (corrected token y at SD reject positions) regions; the reject stream splits into the
     # reject-token (first mismatch d, min offset per anchor) and post-reject (discarded suffix) regions.
-    # Forward regions choose bernoulli_fkl | topk_fkl; reject regions choose reverse_kl | topk_fkl. Top-K is
-    # the in-model forward KL over the teacher/student top-K (both K > 0 -> union). SEMANTIC OVERLOAD: the
-    # top-K FKL rides in existing channels (response: model_output["log_probs"]; reject: the student channel).
-    # Defaults reproduce original draftopd (response Bernoulli forward, reject reverse KL). Pair each region
-    # mode with the matching verl_dflash_*_loss_mode model override.
+    # Forward regions choose bernoulli_fkl | topk_fkl | topk_tv; reject regions choose reverse_kl | topk_fkl.
+    # Top-K (forward KL or total-variation) is computed in-model over the teacher/student top-K (both K > 0 ->
+    # union). SEMANTIC OVERLOAD: the top-K value rides in existing channels (response: model_output["log_probs"];
+    # reject: the student channel). Defaults reproduce original draftopd (response Bernoulli forward, reject
+    # reverse KL). Pair each region mode with the matching verl_dflash_*_loss_mode model override.
     response_loss_mode: str = "bernoulli_fkl"
     reject_accept_loss_mode: str = "bernoulli_fkl"
     reject_token_loss_mode: str = "reverse_kl"

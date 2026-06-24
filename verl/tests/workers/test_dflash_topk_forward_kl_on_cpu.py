@@ -118,6 +118,60 @@ def test_topk_forward_kl_handles_empty_selection():
     assert fkl.numel() == 0 and ent is None
 
 
+def _manual_topk_tv(draft_hidden, teacher_logits, out, b, d, r, mode, k, k_student=None):
+    k_student = k if k_student is None else k_student
+    s_logits = out(draft_hidden[b, d, :]).float()
+    s_p = F.softmax(s_logits, dim=-1)
+    t_logits = teacher_logits[b, r, :].float()
+    t_p = F.softmax(t_logits, dim=-1)
+    sel = torch.zeros_like(t_p, dtype=torch.bool)
+    if mode in ("teacher", "union"):
+        sel.scatter_(-1, t_logits.topk(k, dim=-1).indices, True)
+    if mode in ("student", "union"):
+        sel.scatter_(-1, s_logits.topk(k_student, dim=-1).indices, True)
+    return (0.5 * (t_p - s_p).abs() * sel).sum(dim=-1)
+
+
+def _call_tv(student, draft_hidden, teacher_logits, out, b, d, r, *, mode, k=2, k_student=None, chunk_size=64):
+    return student._compute_topk_tv(
+        draft_hidden=draft_hidden, output_embeddings=out, batch_indices=b, draft_indices=d,
+        teacher_logits=teacher_logits, row_indices=r, chunk_size=chunk_size, mode=mode,
+        topk_teacher=k, topk_student=k if k_student is None else k_student,
+    )
+
+
+def test_topk_tv_matches_manual_each_mode():
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    draft_hidden, teacher_logits, out, b, d, r, _ = _make_inputs()
+    for mode in ("teacher", "student", "union"):
+        tv, _ = _call_tv(student, draft_hidden, teacher_logits, out, b, d, r, mode=mode, k=2, chunk_size=2)
+        expected = _manual_topk_tv(draft_hidden, teacher_logits, out, b, d, r, mode, k=2)
+        assert torch.allclose(tv, expected, atol=1e-6), mode
+        assert tv.shape == (b.numel(),)
+        assert (tv >= 0).all()  # TV is a sum of absolute differences -> always >= 0
+
+
+def test_topk_tv_asymmetric_union_k():
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    draft_hidden, teacher_logits, out, b, d, r, _ = _make_inputs(seed=5)
+    tv, _ = _call_tv(student, draft_hidden, teacher_logits, out, b, d, r, mode="union", k=4, k_student=2, chunk_size=2)
+    expected = _manual_topk_tv(draft_hidden, teacher_logits, out, b, d, r, "union", k=4, k_student=2)
+    assert torch.allclose(tv, expected, atol=1e-6)
+
+
+def test_topk_tv_grad_flows_through_student_only():
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    draft_hidden, teacher_logits, out, b, d, r, _ = _make_inputs()
+    draft_hidden.requires_grad_(True)
+    teacher_logits.requires_grad_(True)
+    tv, _ = _call_tv(student, draft_hidden, teacher_logits, out, b, d, r, mode="union", k=2, chunk_size=2)
+    assert tv.requires_grad
+    tv.sum().backward()
+    assert teacher_logits.grad is None  # teacher term is detached (no_grad)
+    touched = draft_hidden.grad.abs().sum(dim=-1) > 0
+    assert touched[0, 1] and touched[0, 3] and touched[1, 2]
+
+
 def test_collect_rejected_draft_topk_fkl_uses_realized_teacher_and_drops_oob():
     # Request 2 aligns to draftopd's reject geometry: the SAME rollout-reject slots, only the loss differs.
     # Here block_size K=3 (offsets 1,2), prompt_len=2, response_len=4 (valid_len=6), two block anchors at
@@ -274,6 +328,19 @@ def test_response_loss_fn_consumes_model_topk_fkl():
         SimpleNamespace(), SimpleNamespace(distillation_loss=cfg), model_output, data
     )
     assert torch.allclose(losses, no_padding_2_padding(fkl_per_pos, data), atol=1e-6)
+    assert "distillation/response_forward_loss" in metrics
+
+
+def test_response_loss_fn_consumes_model_topk_tv():
+    # topk_tv rides in the same log_probs channel as topk_fkl; the loss consumes it directly.
+    data = _data_one_sample()
+    tv_per_pos = torch.tensor([0.05, 0.12, 0.09, 0.0])
+    model_output = {"log_probs": tv_per_pos, "opd_loss_mask": torch.tensor([1.0, 1.0, 1.0, 0.0])}
+    cfg = _response_cfg(response_loss_mode="topk_tv", reject_accept_loss_mode="topk_tv")
+    losses, metrics = compute_distillation_loss_reverse_kl_estimator(
+        SimpleNamespace(), SimpleNamespace(distillation_loss=cfg), model_output, data
+    )
+    assert torch.allclose(losses, no_padding_2_padding(tv_per_pos, data), atol=1e-6)
     assert "distillation/response_forward_loss" in metrics
 
 

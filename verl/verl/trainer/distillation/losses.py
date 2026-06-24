@@ -957,19 +957,20 @@ def compute_distillation_loss_reverse_kl_estimator(
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
     student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
     response_mask_bool = get_effective_distillation_response_mask(data=data, model_output=model_output)
-    # draftopd response stream (SEMANTIC OVERLOAD): log_probs holds log q(y_j) or a top-K FKL per position.
-    # When a forward region is top-K, select per position by the corrected (reject-accept) mask; else fall
-    # through to the standard forward/reverse path (byte-identical to before, incl. general distillation).
-    response_topk = str(getattr(loss_config, "response_loss_mode", "bernoulli_fkl")) == "topk_fkl"
-    reject_accept_topk = str(getattr(loss_config, "reject_accept_loss_mode", "bernoulli_fkl")) == "topk_fkl"
-    if response_topk or reject_accept_topk:
+    # draftopd response stream (SEMANTIC OVERLOAD): log_probs holds log q(y_j) (bernoulli_fkl) or a precomputed
+    # top-K divergence (topk_fkl / topk_tv). When a forward region is top-K, select per position by the
+    # corrected (reject-accept) mask; else fall through to the standard forward/reverse path (byte-identical to
+    # before, incl. general distillation).
+    response_direct = str(getattr(loss_config, "response_loss_mode", "bernoulli_fkl")) in ("topk_fkl", "topk_tv")
+    reject_accept_direct = str(getattr(loss_config, "reject_accept_loss_mode", "bernoulli_fkl")) in ("topk_fkl", "topk_tv")
+    if response_direct or reject_accept_direct:
         teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
         corrected = _build_corrected_token_mask(data, response_mask_bool)
-        use_topk = (corrected & reject_accept_topk) | (corrected.logical_not() & response_topk)
+        use_direct = (corrected & reject_accept_direct) | (corrected.logical_not() & response_direct)
         bernoulli_losses = _local_bernoulli_forward_kl(
             student_log_probs=student_log_probs, teacher_log_probs=teacher_log_probs, loss_config=loss_config
         )
-        distillation_losses = torch.where(use_topk, student_log_probs, bernoulli_losses)
+        distillation_losses = torch.where(use_direct, student_log_probs, bernoulli_losses)
         return distillation_losses, {
             "distillation/response_forward_loss": Metric(
                 AggregationType.MEAN, _valid_mean(distillation_losses, response_mask_bool)
