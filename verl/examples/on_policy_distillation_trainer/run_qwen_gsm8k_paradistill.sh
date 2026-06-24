@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # paradistill launcher -- on-policy reverse on fresh draft samples.
 #
-# paradistill IS the draftopd framework with exactly two genuine differences, both behind switches:
-#   (1) ANCHOR SELECTION: free anchors (verl_dflash_response_anchor_mode = stride_k | sampled) cover the
-#       response independently of SD reject positions, instead of reject-tied anchors.
-#   (2) REVERSE-TOKEN SOURCE: verl_dflash_onpolicy_reverse_enabled=True re-draws a FRESH on-policy draft
-#       sample y_hat ~ q per (block, offset) slot in the training forward, instead of reusing the
-#       rollout-cached rejected token d. Overlapping sampled-mode blocks are each kept (distinct draws).
-# Everything else is the SHARED draftopd loss. The reverse-stream loss is selected by the per-region modes
-# REJECT_TOKEN_LOSS_MODE / POST_REJECT_LOSS_MODE (default reverse_kl => k3 on log q(y_hat) vs log p(y_hat),
-# unbiased at T_draft=1) -- the SAME path draftopd uses on d. FORWARD_KL_WEIGHT / REVERSE_KL_WEIGHT below
-# now govern ONLY the response stream (Bernoulli forward KL on y_j); they no longer touch the reverse stream.
+# paradistill = the draftopd framework with two genuine differences (anchor selection + a draft-prefix
+# on-policy reverse), everything else shared:
+#   RESPONSE region -> top-K FORWARD KL vs the teacher at the realized prefix (response_loss_mode=topk_fkl).
+#   REVERSE  region -> DRAFT-PREFIX top-K REVERSE KL: the draft samples a fresh block y_hat ~ q from its
+#     heads; the frozen teacher runs ONE verify-forward ALONG the fresh block to get p(.| prefix<=anchor,
+#     y_hat_<o) at each position; then top-K reverse KL between the draft head dist q_o and that teacher dist
+#     (reject_token/post_reject_loss_mode=topk_reverse_kl). Both streams use the same offset decay.
+#   (1) ANCHOR SELECTION: free anchors (verl_dflash_response_anchor_mode = stride_k | sampled).
+#   (2) REVERSE-TOKEN SOURCE: verl_dflash_onpolicy_reverse_enabled=True (fresh y_hat + teacher verify-forward).
+# top-K support is the teacher/student union (TOPK_FKL_*_K both > 0; student_k>0 REQUIRED for topk_reverse_kl).
 #
-# paradistill knobs:    DRAFT_SAMPLE_TEMPERATURE (T_draft, 1.0 = genuine q-samples / unbiased k3 reverse),
-#                DRAFT_SAMPLE_SEED (<0 = fresh each step; >=0 = reproducible per forward).
+# paradistill knobs:    DRAFT_SAMPLE_TEMPERATURE (T_draft for the fresh draft block), DRAFT_SAMPLE_SEED
+#                (<0 = fresh each step; >=0 = reproducible per forward).
 # Anchor knobs:  ANCHOR_MODE (stride_k | sampled), ANCHOR_SAMPLE_RATIO, ANCHOR_SEED.
 # Loss / training knobs are passed straight through to run_qwen_gsm8k_forward-ins.sh via the environment.
 set -euo pipefail
@@ -23,18 +23,22 @@ ANCHOR_MODE=${ANCHOR_MODE:-stride_k}
 ANCHOR_SAMPLE_RATIO=${ANCHOR_SAMPLE_RATIO:-1.0}
 ANCHOR_SEED=${ANCHOR_SEED:-42}
 
-# Response stream = Bernoulli forward only (these weights govern ONLY the response stream now; the reverse
-# stream's loss is the per-region reject mode below, default reverse_kl => k3 on the fresh on-policy samples).
+# Per-region loss modes: response = top-K forward KL; reverse = draft-prefix top-K reverse KL. The top-K
+# value is precomputed in-model, so FORWARD/REVERSE_KL_WEIGHT do NOT enter either stream -- FORWARD_KL_WEIGHT=1
+# is kept only to satisfy the "at least one weight > 0" config check.
 export FORWARD_KL_WEIGHT=${FORWARD_KL_WEIGHT:-1.0}
 export REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT:-0.0}
-# Reverse-stream loss = k3 reverse KL on the fresh sample (default). paradistill is a single reverse region,
-# so REJECT_TOKEN_LOSS_MODE drives it; top-K reject modes are not supported with on-policy reverse.
-export REJECT_TOKEN_LOSS_MODE=${REJECT_TOKEN_LOSS_MODE:-reverse_kl}
-export POST_REJECT_LOSS_MODE=${POST_REJECT_LOSS_MODE:-reverse_kl}
-# Optional per-offset decay on the reverse stream: weight each fresh sample by decay^(offset-1), where
-# offset (1..K) is the draft head index within its block. Default off (uniform). Set =True (and tune
-# REJECTED_DRAFT_POSITION_DECAY, the decay factor) to down-weight far-offset on-policy samples.
-export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED:-False}
+export RESPONSE_LOSS_MODE=${RESPONSE_LOSS_MODE:-topk_fkl}
+export REJECT_ACCEPT_LOSS_MODE=${REJECT_ACCEPT_LOSS_MODE:-topk_fkl}
+export REJECT_TOKEN_LOSS_MODE=${REJECT_TOKEN_LOSS_MODE:-topk_reverse_kl}
+export POST_REJECT_LOSS_MODE=${POST_REJECT_LOSS_MODE:-topk_reverse_kl}
+# Top-K support: union (both > 0). student_k>0 is REQUIRED for topk_reverse_kl (so the draft modes are in S).
+export TOPK_FKL_TEACHER_K=${TOPK_FKL_TEACHER_K:-8}
+export TOPK_FKL_STUDENT_K=${TOPK_FKL_STUDENT_K:-8}
+# Per-offset decay (offset 1..K = draft head index): weight each slot by decay^(offset-1). Applies to BOTH
+# the response (forward) and reverse streams with the SAME factor. Default on at factor 0.8.
+export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED:-True}
+export REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY:-0.8}
 
 DRAFT_SAMPLE_TEMPERATURE=${DRAFT_SAMPLE_TEMPERATURE:-1.0}
 DRAFT_SAMPLE_SEED=${DRAFT_SAMPLE_SEED:--1}
@@ -59,8 +63,11 @@ case "${ONPOLICY_REVERSE,,}" in
         ;;
     *)
         # FORWARD-ONLY: on-policy reverse off + free (non-reject) anchors -> the model emits NO reverse
-        # stream at all (the rollout-reject reverse only runs in reject anchor mode), so no wasted
-        # reverse LM-head softmax. ANCHOR_MODE must be stride_k|sampled (paradistill default), not reject.
+        # stream at all (the rollout-reject reverse only runs in reject anchor mode), so no wasted teacher
+        # verify-forward. Response stays top-K forward KL. Reject modes are reset to reverse_kl so the
+        # "reject-region top-K requires reject anchors / on-policy reverse" guard does not fire.
+        export REJECT_TOKEN_LOSS_MODE=reverse_kl
+        export POST_REJECT_LOSS_MODE=reverse_kl
         REVERSE_OVERRIDES=(
             ++actor_rollout_ref.model.override_config.verl_dflash_onpolicy_reverse_enabled=False
             distillation.distillation_loss.onpolicy_reverse_enabled=False

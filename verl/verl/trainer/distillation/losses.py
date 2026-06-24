@@ -557,6 +557,41 @@ def _build_rejected_draft_position_weights(
     return weights * rejected_draft_mask.to(dtype=torch.float32), True
 
 
+def _build_response_position_weights(
+    *,
+    model_output: dict,
+    data: TensorDict,
+    effective_response_mask: torch.Tensor,
+    loss_config: DistillationLossConfig,
+) -> tuple[torch.Tensor, bool]:
+    """Per-response-token decay weights ``decay^(offset-1)`` (offset = draft head depth) for paradistill.
+
+    Mirrors ``_build_rejected_draft_position_weights`` but for the RESPONSE (forward) stream, so both
+    streams share the same per-offset decay. Returns ``(weights, applied)``; ``weights`` is the plain
+    ``effective_response_mask`` (and ``applied=False``) unless on-policy reverse is on, decay is enabled,
+    and the model emitted ``opd_response_offsets`` -- so draftopd / non-decay paths are byte-identical.
+    """
+    if not bool(getattr(loss_config, "onpolicy_reverse_enabled", False)):
+        return effective_response_mask.to(dtype=torch.float32), False
+    if not bool(getattr(loss_config, "rejected_draft_position_decay_enabled", True)):
+        return effective_response_mask.to(dtype=torch.float32), False
+    offsets_raw = model_output.get("opd_response_offsets")
+    if offsets_raw is None:
+        return effective_response_mask.to(dtype=torch.float32), False
+    decay = float(getattr(loss_config, "rejected_draft_position_decay", 0.9))
+    if decay <= 0.0 or decay > 1.0:
+        raise ValueError(f"rejected_draft_position_decay must be in (0, 1], got {decay}.")
+    offsets = no_padding_2_padding(offsets_raw, data).to(device=effective_response_mask.device)
+    if offsets.shape != effective_response_mask.shape:
+        raise RuntimeError(
+            "Response decay offsets must match the response mask shape, got "
+            f"offsets={tuple(offsets.shape)}, mask={tuple(effective_response_mask.shape)}."
+        )
+    exponents = (offsets.to(dtype=torch.float32) - 1.0).clamp_min(0.0)
+    weights = torch.pow(offsets.new_tensor(decay, dtype=torch.float32), exponents)
+    return weights * effective_response_mask.to(dtype=torch.float32), True
+
+
 def _agg_loss_global_batch_info(config: ActorConfig) -> dict[str, Any]:
     global_batch_info = getattr(config, "global_batch_info", {}) or {}
     return {key: value for key, value in global_batch_info.items() if key in _AGG_LOSS_GLOBAL_BATCH_INFO_KEYS}
@@ -739,13 +774,26 @@ def distillation_loss(
             response_weight = float(getattr(loss_config, "response_stream_weight", 1.0))
             rejected_weight = float(getattr(loss_config, "rejected_draft_stream_weight", 1.0))
             global_batch_info = getattr(config, "global_batch_info", {}) or {}
+            # Response stream per-offset decay (paradistill): weight each response token by decay^(offset-1),
+            # same factor as the reverse stream. No-op (plain mask) for draftopd / decay-off -> unchanged.
+            response_weights, response_decay_applied = _build_response_position_weights(
+                model_output=model_output,
+                data=data,
+                effective_response_mask=effective_response_mask,
+                loss_config=loss_config,
+            )
             response_count = effective_response_mask.sum().to(dtype=distillation_losses.dtype)
+            response_effective_count = response_weights.sum().to(dtype=distillation_losses.dtype)
             rejected_count = rejected_draft_mask.sum().to(dtype=distillation_losses.dtype)
             rejected_effective_count = rejected_loss_weights.sum().to(dtype=distillation_losses.dtype)
-            response_sum = (distillation_losses * effective_response_mask).sum()
+            response_sum = (distillation_losses * response_weights.to(dtype=distillation_losses.dtype)).sum()
             rejected_sum = (rejected_draft_losses * rejected_loss_weights.to(dtype=rejected_draft_losses.dtype)).sum()
             global_response_count = global_batch_info.get("batch_num_tokens")
-            if global_response_count is None:
+            if response_decay_applied:
+                # decay-weighted numerator -> the denominator must use the (global) decay-weight sum, not the
+                # plain token count (mirrors the reverse stream's effective-count handling).
+                global_response_count = _global_sum(response_effective_count, dp_group)
+            elif global_response_count is None:
                 global_response_count = response_count
             global_rejected_count = global_batch_info.get("opd_rejected_draft_batch_num_tokens")
             global_rejected_effective_count = global_batch_info.get(

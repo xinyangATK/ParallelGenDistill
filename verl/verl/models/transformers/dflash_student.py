@@ -135,6 +135,61 @@ def create_dflash_block_mask(
     )
 
 
+def create_dflash_verify_sdpa_mask(
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    seq_len: int,
+    block_size: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Additive (0 / -inf) 4D mask ``(B, 1, L, L)`` for the teacher VERIFY forward, ``L = seq_len + Q``.
+
+    Unlike ``create_dflash_sdpa_mask`` (draft: separated q=appended / kv=context+appended), the teacher is
+    a standard self-attention model, so this is a FULL ``L x L`` mask over ``[context | appended fresh-block
+    slots]``:
+      - context query rows (``q < seq_len``): standard causal among context, no attention to slots;
+      - slot query rows (block ``b``, offset ``o``): attend to context ``kv < anchor_b`` AND own-block slots
+        ``0..o`` (CAUSAL within block -- so slot ``o`` sees only ``anchor, y_hat_1..y_hat_o``), gated by
+        ``block_keep_mask``.
+    With position_ids = anchor+offset, the teacher output at block slot ``s`` equals the next-token
+    distribution of a plain causal forward on ``[prefix<=anchor, y_hat_1..y_hat_s]`` (verified by the
+    oracle test ``test_dflash_teacher_verify_on_cpu``).
+    """
+    batch_size, num_blocks = anchor_positions.shape
+    q_total = num_blocks * block_size
+    total_len = seq_len + q_total
+
+    idx = torch.arange(total_len, device=device)
+    is_ctx = idx < seq_len  # (L,)
+    slot_idx = (idx - seq_len).clamp(min=0)
+    block_id = slot_idx // block_size  # (L,)
+    offset_id = slot_idx % block_size  # (L,)
+
+    q_is_ctx = is_ctx.view(1, total_len, 1)
+    kv_is_ctx = is_ctx.view(1, 1, total_len)
+    q_idx = idx.view(1, total_len, 1)
+    kv_idx = idx.view(1, 1, total_len)
+
+    # context query rows: causal among context tokens.
+    causal_ctx = q_is_ctx & kv_is_ctx & (kv_idx <= q_idx)
+
+    # slot query rows: anchor per (batch, q-block).
+    safe_q_block = block_id.clamp(max=num_blocks - 1).view(1, total_len).expand(batch_size, total_len)
+    anchor_q = torch.gather(anchor_positions, 1, safe_q_block).view(batch_size, total_len, 1)
+    slot_ctx = (~q_is_ctx) & kv_is_ctx & (kv_idx < anchor_q)
+    same_block = block_id.view(1, total_len, 1) == block_id.view(1, 1, total_len)
+    causal_within = offset_id.view(1, 1, total_len) <= offset_id.view(1, total_len, 1)
+    slot_block = (~q_is_ctx) & (~kv_is_ctx) & same_block & causal_within
+    keep_q = torch.gather(block_keep_mask, 1, safe_q_block).view(batch_size, total_len, 1)
+    slot_rows = (slot_ctx | slot_block) & keep_q
+
+    allow = causal_ctx | slot_rows  # (B, L, L)
+    mask = torch.zeros((batch_size, 1, total_len, total_len), device=device, dtype=dtype)
+    mask.masked_fill_(~allow.unsqueeze(1), torch.finfo(dtype).min)
+    return mask
+
+
 def _set_config_attn_implementation(config: Any, attn_impl: str) -> None:
     for attr_name in ("_attn_implementation", "_attn_implementation_internal", "attn_implementation"):
         if hasattr(config, attr_name):
@@ -570,74 +625,34 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         selected_entropy = torch.cat(entropy_chunks, dim=0) if calculate_entropy else None
         return selected_log_probs, selected_entropy
 
-    def _compute_response_and_reverse_log_probs(
+    def _sample_draft_tokens(
         self,
         *,
         draft_hidden: torch.Tensor,
         output_embeddings: torch.nn.Module,
         batch_indices: torch.LongTensor,
         draft_indices: torch.LongTensor,
-        token_ids: torch.LongTensor,
-        teacher_logits: torch.Tensor,
-        row_indices: torch.LongTensor,
-        chunk_size: int,
-        calculate_entropy: bool,
         sample_temperature: float,
+        chunk_size: int,
         generator: Optional[torch.Generator] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
-        """paradistill fused LM-head pass: from ONE draft->vocab projection per slot,
-        return both the response-forward and the on-policy reverse terms.
+    ) -> torch.LongTensor:
+        """Draw one fresh on-policy token ``y_hat ~ q_phi`` (at ``sample_temperature``) per draft slot.
 
-        At each ``(batch_indices, draft_indices)`` slot it computes the draft log-probs ONCE and returns:
-          - ``log q(y_j)`` gathered at the realized response token ``token_ids`` (with gradient) -- the
-            response-forward term -- plus optional draft entropy;
-          - a fresh draft sample ``y_hat ~ q_phi^(j)`` drawn at ``sample_temperature`` (no gradient) with
-            ``log q(y_hat)`` from the SAME log-probs (with gradient) and ``log p(y_hat)`` from the frozen
-            teacher logits at ``row_indices`` (no gradient) -- the reverse term -- plus ``y_hat`` ids.
-        Gradients are identical to projecting twice: both gathers backprop through the shared log-probs
-        into ``draft_hidden`` (the head is the frozen main-model head, so only draft params get grad).
-        ``log q`` uses temperature 1 so the k3 reverse-KL is unbiased when ``sample_temperature == 1``.
+        Returns ``(N,)`` sampled token ids for the slots ``(batch_indices, draft_indices)``; no gradient
+        (the samples only define the teacher's verify-forward conditioning, the loss grad flows through the
+        draft head's own distribution, computed separately in the top-K reverse KL).
         """
         if batch_indices.numel() == 0:
-            empty = draft_hidden.new_empty((0,), dtype=torch.float32)
-            empty_ids = batch_indices.new_empty((0,), dtype=torch.long)
-            return empty, (empty if calculate_entropy else None), empty, empty, empty_ids
-
+            return batch_indices.new_empty((0,), dtype=torch.long)
         selected_hidden = draft_hidden[batch_indices, draft_indices, :]
-        resp_log_q_chunks: list[torch.Tensor] = []
-        entropy_chunks: list[torch.Tensor] = []
-        rev_log_q_chunks: list[torch.Tensor] = []
-        rev_log_p_chunks: list[torch.Tensor] = []
         sample_chunks: list[torch.Tensor] = []
-        for start in range(0, selected_hidden.shape[0], chunk_size):
-            end = min(start + chunk_size, selected_hidden.shape[0])
-            draft_logits = output_embeddings(selected_hidden[start:end]).float()
-            draft_log_probs = F.log_softmax(draft_logits, dim=-1)  # shared by both terms
-            # response-forward term: log q at the realized token y_j
-            resp_labels = token_ids[start:end].to(device=draft_log_probs.device)
-            resp_log_q_chunks.append(draft_log_probs.gather(dim=-1, index=resp_labels.unsqueeze(-1)).squeeze(-1))
-            if calculate_entropy:
-                entropy_chunks.append(-(draft_log_probs.exp() * draft_log_probs).sum(dim=-1))
-            # on-policy reverse term: sample y_hat ~ q at T_draft, reuse draft_log_probs for log q(y_hat)
-            with torch.no_grad():
-                sample_probs = F.softmax(draft_logits / sample_temperature, dim=-1)
-                sampled = torch.multinomial(sample_probs, num_samples=1, generator=generator).squeeze(-1)
-                teacher_chunk_logits = teacher_logits[
-                    batch_indices[start:end], row_indices[start:end], :
-                ].float()
-                teacher_log_probs = F.log_softmax(teacher_chunk_logits, dim=-1)
-                rev_log_p_chunks.append(teacher_log_probs.gather(dim=-1, index=sampled.unsqueeze(-1)).squeeze(-1))
-            rev_log_q_chunks.append(draft_log_probs.gather(dim=-1, index=sampled.unsqueeze(-1)).squeeze(-1))
-            sample_chunks.append(sampled)
-
-        resp_entropy = torch.cat(entropy_chunks, dim=0) if calculate_entropy else None
-        return (
-            torch.cat(resp_log_q_chunks, dim=0),
-            resp_entropy,
-            torch.cat(rev_log_q_chunks, dim=0),
-            torch.cat(rev_log_p_chunks, dim=0),
-            torch.cat(sample_chunks, dim=0),
-        )
+        with torch.no_grad():
+            for start in range(0, selected_hidden.shape[0], chunk_size):
+                end = min(start + chunk_size, selected_hidden.shape[0])
+                logits = output_embeddings(selected_hidden[start:end]).float()
+                probs = F.softmax(logits / sample_temperature, dim=-1)
+                sample_chunks.append(torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1))
+        return torch.cat(sample_chunks, dim=0)
 
     @staticmethod
     def _topk_candidate_support(student_logits, teacher_chunk_logits, mode, topk_teacher, topk_student):
@@ -794,6 +809,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         topk_teacher: int,
         topk_student: int,
         calculate_entropy: bool = False,
+        teacher_output_embeddings: Optional[torch.nn.Module] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Per-slot top-K reverse KL ``sum_{v in S} q_s(v) (log q_s(v) - log p_t(v))``.
 
@@ -803,15 +819,21 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         full-vocab softmax materialized). The partial-support sum is clamped to >=0 (top-K mass < 1). At a
         reject position the top-K support contains both the corrected token y (teacher mode) and the rejected
         token d (student mode), so one reverse KL trains both without separating them.
+
+        ``teacher_output_embeddings``: when given, ``teacher_logits`` is the teacher HIDDEN states (e.g. the
+        per-slot output of ``_run_teacher_block_verify_forward``) and is projected to logits per chunk via
+        this LM head (so no full ``(B, Q, V)`` teacher-logit tensor is materialized). paradistill's
+        draft-prefix reverse uses this: teacher = ``p(.| prefix<=anchor, y_hat_<o)`` at verify slot ``o-1``.
         """
         if batch_indices.numel() == 0:
             empty = draft_hidden.new_empty((0,), dtype=torch.float32)
             return empty, (empty if calculate_entropy else None)
 
+        teacher_is_hidden = teacher_output_embeddings is not None
         selected_hidden = draft_hidden[batch_indices, draft_indices, :]
         rkl_chunks: list[torch.Tensor] = []
         entropy_chunks: list[torch.Tensor] = []
-        vocab_size = int(teacher_logits.shape[-1])
+        vocab_size = int(output_embeddings.weight.shape[0]) if teacher_is_hidden else int(teacher_logits.shape[-1])
         topk_teacher = min(int(topk_teacher), vocab_size)
         topk_student = min(int(topk_student), vocab_size)
         for start in range(0, selected_hidden.shape[0], chunk_size):
@@ -819,7 +841,12 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             student_logits = output_embeddings(selected_hidden[start:end]).float()
             student_lse = torch.logsumexp(student_logits, dim=-1, keepdim=True)  # (n, 1); grad to all logits
             with torch.no_grad():
-                teacher_chunk_logits = teacher_logits[batch_indices[start:end], row_indices[start:end], :].float()
+                if teacher_is_hidden:
+                    teacher_chunk_logits = teacher_output_embeddings(
+                        teacher_logits[batch_indices[start:end], row_indices[start:end], :]
+                    ).float()
+                else:
+                    teacher_chunk_logits = teacher_logits[batch_indices[start:end], row_indices[start:end], :].float()
                 teacher_lse = torch.logsumexp(teacher_chunk_logits, dim=-1, keepdim=True)
                 cand_idx, keep = self._topk_candidate_support(
                     student_logits, teacher_chunk_logits, mode, topk_teacher, topk_student
@@ -1356,6 +1383,68 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             student_tensor[_long([b for b, _ in bucket["items"]]), _long([c for _, c in bucket["items"]])] = values
         return student_tensor, teacher_tensor, mask_tensor, is_reject_token_tensor
 
+    def _run_teacher_block_verify_forward(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        anchor_positions: torch.LongTensor,
+        block_keep_mask: torch.Tensor,
+        slot_token_ids: torch.LongTensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        """paradistill draft-prefix scoring: ONE frozen-teacher verify forward along the FRESH blocks.
+
+        ``slot_token_ids`` packs, per block, ``[anchor_token, y_hat_1, ..., y_hat_{block_size-1}]`` (slot 0 =
+        the real anchor token; slots >=1 = the draft's freshly-sampled tokens). The teacher processes
+        ``[full context | appended slots]`` with the block-diagonal causal verify mask + position_ids =
+        anchor+offset, so the hidden at block slot ``s`` is the teacher state conditioned on
+        ``(prefix<=anchor, y_hat_1..y_hat_s)``. The draft head predicting ``anchor+o`` (offset ``o``) is
+        matched against the teacher distribution at slot ``o-1`` (= ``p(.| prefix<=anchor, y_hat_<o)``).
+        Returns the per-slot teacher hidden states ``(B, num_blocks*block_size, hidden)`` (no grad).
+        """
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+        base = getattr(self.main_model, "model", self.main_model)
+        main_embed = self.main_model.get_input_embeddings()
+
+        context_embeds = main_embed(input_ids)
+        slot_embeds = main_embed(slot_token_ids)
+        full_embeds = torch.cat([context_embeds, slot_embeds], dim=1)
+
+        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        slot_position_ids = self._create_position_ids_for_anchors(anchor_positions, block_size=block_size)
+        full_position_ids = torch.cat([context_position_ids, slot_position_ids], dim=1)
+
+        verify_mask = create_dflash_verify_sdpa_mask(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            seq_len=seq_len,
+            block_size=block_size,
+            device=device,
+            dtype=full_embeds.dtype,
+        )
+
+        # Arbitrary 4D masks need sdpa/eager (flash_attention_2 rejects them). main_model is frozen; force
+        # sdpa for this verify call and restore the prior impl so the main teacher forward is unaffected.
+        base_config = getattr(base, "config", None)
+        prior_impl = str(getattr(base_config, "_attn_implementation", "sdpa")) if base_config is not None else None
+        if base_config is not None and prior_impl == "flash_attention_2":
+            _set_config_attn_implementation(base_config, "sdpa")
+        try:
+            with torch.no_grad():
+                verify_outputs = base(
+                    inputs_embeds=full_embeds,
+                    attention_mask=verify_mask,
+                    position_ids=full_position_ids,
+                    use_cache=False,
+                )
+        finally:
+            if base_config is not None and prior_impl == "flash_attention_2":
+                _set_config_attn_implementation(base_config, prior_impl)
+
+        hidden = verify_outputs.last_hidden_state if hasattr(verify_outputs, "last_hidden_state") else verify_outputs[0]
+        return hidden[:, seq_len:, :]
+
     def _run_dflash_draft_forward(
         self,
         *,
@@ -1568,15 +1657,23 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 "paradistill on-policy reverse (verl_dflash_onpolicy_reverse_enabled) is not supported together "
                 "with verl_dflash_random_response_anchor_enabled."
             )
-        if topk_enabled and (onpolicy_reverse_enabled or random_response_anchor_enabled):
+        if topk_enabled and random_response_anchor_enabled:
             raise NotImplementedError(
-                "draftopd top-K losses (topk_fkl / topk_tv) are not supported together with on-policy reverse "
-                "or random response anchors."
+                "draftopd top-K losses (topk_fkl / topk_tv) are not supported together with random response anchors."
             )
-        if (reject_token_topk or post_reject_topk) and response_anchor_mode != "reject":
+        if onpolicy_reverse_enabled and not (
+            reject_token_loss_mode == "topk_reverse_kl" and post_reject_loss_mode == "topk_reverse_kl"
+        ):
+            raise NotImplementedError(
+                "paradistill on-policy reverse uses the draft-prefix top-K reverse KL (the frozen teacher runs a "
+                "verify-forward along the freshly-sampled block), so reject_token_loss_mode and post_reject_loss_mode "
+                "must both be 'topk_reverse_kl'. The realized-prefix k3 reverse path has been removed."
+            )
+        if (reject_token_topk or post_reject_topk) and response_anchor_mode != "reject" and not onpolicy_reverse_enabled:
             raise NotImplementedError(
                 "draftopd reject-region top-K losses (reject_token/post_reject loss_mode=topk_fkl|topk_reverse_kl) "
-                "require reject-mode anchors."
+                "require reject-mode anchors (free anchors are only supported via on-policy reverse, the paradistill "
+                "draft-prefix path)."
             )
         topk_fkl_teacher_k = self._get_topk_fkl_teacher_k() if topk_enabled else 0
         topk_fkl_student_k = self._get_topk_fkl_student_k() if topk_enabled else 0
@@ -1671,6 +1768,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         lm_head_start_time = time.perf_counter()
         log_probs_by_seq = target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32)
         loss_mask_by_seq = target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32)
+        # Per-response-token draft offset (1..K), for the paradistill response-stream per-offset decay; stays
+        # all-zero for draftopd (the loss only reads it under on-policy reverse).
+        response_offsets_by_seq = torch.zeros((batch_size, seq_len), dtype=torch.long, device=input_ids.device)
         entropy_by_seq = (
             target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32) if calculate_entropy else None
         )
@@ -1688,7 +1788,6 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         # by sequence position. Overlapping blocks (sampled-mode anchors) each re-sample their own fresh
         # draft token from a different head/context, so every slot is a distinct on-policy sample and must
         # contribute its own reverse loss -- no per-position dedup. N_rejected = total slots (>= N_response).
-        onpolicy_flat_log_q = onpolicy_flat_log_p = onpolicy_flat_offsets = None
         response_lm_token_count = 0
         attn_impl = str(getattr(getattr(self.draft_model, "config", None), "_attn_implementation", "eager"))
         ran_draft_forward = False
@@ -1737,132 +1836,160 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 response_draft_tensor = torch.cat(response_draft_indices, dim=0)
                 response_row_tensor = torch.cat(response_row_indices, dim=0)
                 response_label_tensor = torch.cat(response_labels, dim=0)
-                if onpolicy_reverse_enabled:
-                    # paradistill: ONE draft->vocab projection per slot yields both the response-forward
-                    # log q(y_j) AND a fresh on-policy reverse sample y_hat with log q(y_hat) [grad] /
-                    # log p(y_hat) [no grad]. Slots stay flat (overlap duplicates of sampled-mode anchors
-                    # retained), so the reverse loss is computed on every re-sampled block.
-                    sample_generator = None
-                    if draft_sample_seed >= 0:
-                        sample_generator = torch.Generator(device=draft_hidden.device).manual_seed(
-                            int(draft_sample_seed)
-                        )
-                    selected_log_probs, selected_entropy, onpolicy_flat_log_q, onpolicy_flat_log_p, _ = (
-                        self._compute_response_and_reverse_log_probs(
+                # Forward response stream (SEMANTIC OVERLOAD): each slot's log_probs channel holds log q(y_j)
+                # (bernoulli_fkl) or a precomputed top-K divergence (topk_fkl / topk_tv). Response uses
+                # response_loss_mode; the reject-accept region (corrected y, reject-mode anchors only) uses
+                # reject_accept_loss_mode. This path is shared by draftopd and paradistill -- paradistill (free
+                # anchors) is uniform here (default topk_fkl), and adds the reverse stream separately below.
+                def _forward_region_values(mode, sel_batch, sel_draft, sel_row, sel_labels):
+                    if mode in ("topk_fkl", "topk_tv"):
+                        topk_fn = self._compute_topk_forward_kl if mode == "topk_fkl" else self._compute_topk_tv
+                        return topk_fn(
                             draft_hidden=draft_hidden,
                             output_embeddings=output_embeddings,
-                            batch_indices=response_batch_tensor,
-                            draft_indices=response_draft_tensor,
-                            token_ids=response_label_tensor,
+                            batch_indices=sel_batch,
+                            draft_indices=sel_draft,
                             teacher_logits=teacher_logits,
-                            row_indices=response_row_tensor,
+                            row_indices=sel_row,
                             chunk_size=lm_head_chunk_size,
+                            mode=topk_fkl_mode,
+                            topk_teacher=topk_fkl_teacher_k,
+                            topk_student=topk_fkl_student_k,
                             calculate_entropy=calculate_entropy,
-                            sample_temperature=draft_sample_temperature,
-                            generator=sample_generator,
                         )
+                    return self._compute_selected_lm_log_probs(  # bernoulli_fkl -> log q(y_j)
+                        draft_hidden=draft_hidden,
+                        output_embeddings=output_embeddings,
+                        batch_indices=sel_batch,
+                        draft_indices=sel_draft,
+                        token_ids=sel_labels,
+                        chunk_size=lm_head_chunk_size,
+                        calculate_entropy=calculate_entropy,
                     )
-                    # Each slot's draft index packs anchor_block * block_size + offset, so the offset (the
-                    # draft head index, 1..K) recovers from a modulo -- used for optional per-offset decay.
-                    onpolicy_flat_offsets = response_draft_tensor % draft_block_size
+
+                response_split = (
+                    response_anchor_mode == "reject" and response_loss_mode != reject_accept_loss_mode
+                )
+                if not response_split:
+                    # Uniform: one helper call on the full response tensors (pre-refactor hot path -- no
+                    # mask/nonzero/gather).
+                    selected_log_probs, selected_entropy = _forward_region_values(
+                        response_loss_mode, response_batch_tensor, response_draft_tensor,
+                        response_row_tensor, response_label_tensor,
+                    )
                     log_probs_by_seq[response_batch_tensor, response_row_tensor] = selected_log_probs
                     loss_mask_by_seq[response_batch_tensor, response_row_tensor] = 1.0
                     if entropy_by_seq is not None and selected_entropy is not None:
                         entropy_by_seq[response_batch_tensor, response_row_tensor] = selected_entropy
                 else:
-                    # Forward response stream (SEMANTIC OVERLOAD): each slot's log_probs channel holds log q(y_j)
-                    # (bernoulli_fkl) or a precomputed top-K divergence (topk_fkl / topk_tv). The response
-                    # (accepted) region uses response_loss_mode, the reject-accept region (corrected y) uses
-                    # reject_accept_loss_mode.
-                    def _forward_region_values(mode, sel_batch, sel_draft, sel_row, sel_labels):
-                        if mode in ("topk_fkl", "topk_tv"):
-                            topk_fn = self._compute_topk_forward_kl if mode == "topk_fkl" else self._compute_topk_tv
-                            return topk_fn(
-                                draft_hidden=draft_hidden,
-                                output_embeddings=output_embeddings,
-                                batch_indices=sel_batch,
-                                draft_indices=sel_draft,
-                                teacher_logits=teacher_logits,
-                                row_indices=sel_row,
-                                chunk_size=lm_head_chunk_size,
-                                mode=topk_fkl_mode,
-                                topk_teacher=topk_fkl_teacher_k,
-                                topk_student=topk_fkl_student_k,
-                                calculate_entropy=calculate_entropy,
-                            )
-                        return self._compute_selected_lm_log_probs(  # bernoulli_fkl -> log q(y_j)
-                            draft_hidden=draft_hidden,
-                            output_embeddings=output_embeddings,
-                            batch_indices=sel_batch,
-                            draft_indices=sel_draft,
-                            token_ids=sel_labels,
-                            chunk_size=lm_head_chunk_size,
-                            calculate_entropy=calculate_entropy,
-                        )
-
-                    response_split = (
-                        response_anchor_mode == "reject" and response_loss_mode != reject_accept_loss_mode
+                    # Mixed forward modes: split by region (corrected = the predicted label token sits at an
+                    # SD reject position) and dispatch each subset to its mode's helper.
+                    corrected_seq_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
                     )
-                    if not response_split:
-                        # Uniform: one helper call on the full response tensors (pre-refactor hot path -- no
-                        # mask/nonzero/gather).
-                        selected_log_probs, selected_entropy = _forward_region_values(
-                            response_loss_mode, response_batch_tensor, response_draft_tensor,
-                            response_row_tensor, response_label_tensor,
+                    if reject_token_indices is not None and reject_token_indices.numel() > 0:
+                        rj = reject_token_indices.to(torch.long)
+                        rj_valid = (rj >= 0) & (rj < response_lengths.unsqueeze(1))
+                        seq_pos = (prompt_lengths.unsqueeze(1) + rj).clamp_(0, seq_len - 1)
+                        rows = torch.arange(batch_size, device=input_ids.device).unsqueeze(1).expand_as(rj)
+                        corrected_seq_mask[rows[rj_valid], seq_pos[rj_valid]] = True
+                    slot_is_corrected = corrected_seq_mask[response_batch_tensor, response_row_tensor + 1]
+                    for mode in dict.fromkeys((response_loss_mode, reject_accept_loss_mode)):
+                        sel = torch.zeros(response_batch_tensor.numel(), dtype=torch.bool, device=input_ids.device)
+                        if response_loss_mode == mode:
+                            sel = sel | slot_is_corrected.logical_not()
+                        if reject_accept_loss_mode == mode:
+                            sel = sel | slot_is_corrected
+                        sub = torch.nonzero(sel, as_tuple=False).squeeze(-1)
+                        sub_batch = response_batch_tensor[sub]
+                        sub_row = response_row_tensor[sub]
+                        sub_vals, sub_entropy = _forward_region_values(
+                            mode, sub_batch, response_draft_tensor[sub], sub_row, response_label_tensor[sub],
                         )
-                        log_probs_by_seq[response_batch_tensor, response_row_tensor] = selected_log_probs
-                        loss_mask_by_seq[response_batch_tensor, response_row_tensor] = 1.0
-                        if entropy_by_seq is not None and selected_entropy is not None:
-                            entropy_by_seq[response_batch_tensor, response_row_tensor] = selected_entropy
-                    else:
-                        # Mixed forward modes: split by region (corrected = the predicted label token sits at an
-                        # SD reject position) and dispatch each subset to its mode's helper.
-                        corrected_seq_mask = torch.zeros(
-                            (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
-                        )
-                        if reject_token_indices is not None and reject_token_indices.numel() > 0:
-                            rj = reject_token_indices.to(torch.long)
-                            rj_valid = (rj >= 0) & (rj < response_lengths.unsqueeze(1))
-                            seq_pos = (prompt_lengths.unsqueeze(1) + rj).clamp_(0, seq_len - 1)
-                            rows = torch.arange(batch_size, device=input_ids.device).unsqueeze(1).expand_as(rj)
-                            corrected_seq_mask[rows[rj_valid], seq_pos[rj_valid]] = True
-                        slot_is_corrected = corrected_seq_mask[response_batch_tensor, response_row_tensor + 1]
-                        for mode in dict.fromkeys((response_loss_mode, reject_accept_loss_mode)):
-                            sel = torch.zeros(response_batch_tensor.numel(), dtype=torch.bool, device=input_ids.device)
-                            if response_loss_mode == mode:
-                                sel = sel | slot_is_corrected.logical_not()
-                            if reject_accept_loss_mode == mode:
-                                sel = sel | slot_is_corrected
-                            sub = torch.nonzero(sel, as_tuple=False).squeeze(-1)
-                            sub_batch = response_batch_tensor[sub]
-                            sub_row = response_row_tensor[sub]
-                            sub_vals, sub_entropy = _forward_region_values(
-                                mode, sub_batch, response_draft_tensor[sub], sub_row, response_label_tensor[sub],
-                            )
-                            log_probs_by_seq[sub_batch, sub_row] = sub_vals
-                            loss_mask_by_seq[sub_batch, sub_row] = 1.0
-                            if entropy_by_seq is not None and sub_entropy is not None:
-                                entropy_by_seq[sub_batch, sub_row] = sub_entropy
+                        log_probs_by_seq[sub_batch, sub_row] = sub_vals
+                        loss_mask_by_seq[sub_batch, sub_row] = 1.0
+                        if entropy_by_seq is not None and sub_entropy is not None:
+                            entropy_by_seq[sub_batch, sub_row] = sub_entropy
                 response_lm_token_count = response_batch_tensor.numel()
 
-            if onpolicy_reverse_enabled:
-                # paradistill feeds the fresh-sample reverse stream through the rejected-draft channel.
-                # Pack the flat per-slot tensors into per-SAMPLE rows (batch, width) -- overlap duplicates
-                # kept as separate columns, per-slot offsets (1..K) carried for optional decay -- so the
-                # engine's per-sample dynamic-batch restore and the loss both see the standard layout. When
-                # there are no slots the zero-initialized (batch, rejected_width) buffers already give an
-                # all-False mask (the loss skips the reverse stream), so only the populated case is handled.
-                if onpolicy_flat_log_q is not None and onpolicy_flat_log_q.numel() > 0:
-                    col, width = self._per_sample_slot_columns(response_batch_tensor, batch_size)
-                    rejected_student_log_probs = target_hidden.new_zeros((batch_size, width), dtype=torch.float32)
-                    rejected_teacher_log_probs = target_hidden.new_zeros((batch_size, width), dtype=torch.float32)
-                    rejected_loss_mask = torch.zeros((batch_size, width), dtype=torch.bool, device=input_ids.device)
-                    rejected_offsets = torch.zeros((batch_size, width), dtype=torch.long, device=input_ids.device)
-                    rejected_student_log_probs[response_batch_tensor, col] = onpolicy_flat_log_q
-                    rejected_teacher_log_probs[response_batch_tensor, col] = onpolicy_flat_log_p
-                    rejected_loss_mask[response_batch_tensor, col] = True
-                    rejected_offsets[response_batch_tensor, col] = onpolicy_flat_offsets.to(torch.long)
-                    rejected_draft_offsets = rejected_offsets
+            if onpolicy_reverse_enabled and response_batch_indices:
+                # paradistill DRAFT-PREFIX reverse: the draft samples a fresh block y_hat ~ q from its heads;
+                # the frozen teacher runs ONE verify-forward ALONG the fresh block to get p(.| prefix<=anchor,
+                # y_hat_<o) at each position; then a top-K reverse KL between the draft head dist q_o (draft
+                # slot o) and that teacher dist (verify slot o-1). The precomputed reverse-KL value rides in the
+                # rejected-draft student channel (reject_token/post_reject_loss_mode=topk_reverse_kl); offsets
+                # (1..K) are carried for the per-offset decay. Overlapping sampled-mode slots are each kept.
+                sample_generator = None
+                if draft_sample_seed >= 0:
+                    sample_generator = torch.Generator(device=draft_hidden.device).manual_seed(int(draft_sample_seed))
+                # 1. sample y_hat ~ q at each response slot (draft head, offset o at draft slot o).
+                onpolicy_samples = self._sample_draft_tokens(
+                    draft_hidden=draft_hidden,
+                    output_embeddings=output_embeddings,
+                    batch_indices=response_batch_tensor,
+                    draft_indices=response_draft_tensor,
+                    sample_temperature=draft_sample_temperature,
+                    chunk_size=lm_head_chunk_size,
+                    generator=sample_generator,
+                )
+                # 2. pack per-block slot tokens for the verify-forward: slot 0 = anchor token (kept blocks),
+                #    slot o = y_hat at offset o; out-of-range tail slots stay mask_token (never read nor
+                #    conditioned-on by an in-bounds head, since in-bounds offsets are a contiguous 1..m prefix).
+                mask_token_id = self._get_mask_token_id()
+                num_anchor_blocks = anchor_positions.shape[1]
+                slot_token_ids = torch.full(
+                    (batch_size, num_anchor_blocks * draft_block_size),
+                    mask_token_id,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+                block_slot0 = (torch.arange(num_anchor_blocks, device=input_ids.device) * draft_block_size)
+                block_slot0 = block_slot0.unsqueeze(0).expand(batch_size, -1)
+                anchor_tokens = torch.gather(input_ids, 1, anchor_positions.clamp(0, seq_len - 1))
+                block_rows = torch.arange(batch_size, device=input_ids.device).unsqueeze(1).expand(batch_size, num_anchor_blocks)
+                slot_token_ids[block_rows, block_slot0] = torch.where(
+                    block_keep_mask, anchor_tokens, slot_token_ids.new_tensor(mask_token_id)
+                )
+                slot_token_ids[response_batch_tensor, response_draft_tensor] = onpolicy_samples
+                # 3. teacher verify-forward along the fresh blocks (frozen, no grad).
+                verify_hidden = self._run_teacher_block_verify_forward(
+                    input_ids=input_ids,
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                    slot_token_ids=slot_token_ids,
+                    block_size=draft_block_size,
+                )
+                # 4. top-K reverse KL: draft q_o (draft slot o = response_draft_tensor) vs teacher dist at
+                #    verify slot (o-1 = response_draft_tensor - 1). Teacher logits projected per-chunk from the
+                #    verify hidden (no full (B, Q, V) materialization). Grad flows only through the draft head.
+                reverse_topk_values, _ = self._compute_topk_reverse_kl(
+                    draft_hidden=draft_hidden,
+                    output_embeddings=output_embeddings,
+                    batch_indices=response_batch_tensor,
+                    draft_indices=response_draft_tensor,
+                    teacher_logits=verify_hidden,
+                    teacher_output_embeddings=output_embeddings,
+                    row_indices=response_draft_tensor - 1,
+                    chunk_size=lm_head_chunk_size,
+                    mode=topk_fkl_mode,
+                    topk_teacher=topk_fkl_teacher_k,
+                    topk_student=topk_fkl_student_k,
+                )
+                # 5. pack the per-slot reverse-KL values into per-sample (batch, width) rejected-draft rows.
+                col, width = self._per_sample_slot_columns(response_batch_tensor, batch_size)
+                rejected_student_log_probs = target_hidden.new_zeros((batch_size, width), dtype=torch.float32)
+                rejected_teacher_log_probs = target_hidden.new_zeros((batch_size, width), dtype=torch.float32)
+                rejected_loss_mask = torch.zeros((batch_size, width), dtype=torch.bool, device=input_ids.device)
+                rejected_offsets = torch.zeros((batch_size, width), dtype=torch.long, device=input_ids.device)
+                rejected_student_log_probs[response_batch_tensor, col] = reverse_topk_values.to(torch.float32)
+                rejected_loss_mask[response_batch_tensor, col] = True
+                rejected_offsets[response_batch_tensor, col] = (response_draft_tensor % draft_block_size).to(torch.long)
+                rejected_draft_offsets = rejected_offsets
+                # Same per-offset value at the response positions, so the response (forward) stream can share
+                # the reverse stream's decay^(offset-1) weighting (paradistill: both streams decayed).
+                response_offsets_by_seq[response_batch_tensor, response_row_tensor] = (
+                    response_draft_tensor % draft_block_size
+                ).to(torch.long)
             elif reject_stream_active and not split_random_rejected_pass:
                 # draftopd reject stream: reject-token + post-reject regions, each reverse_kl or top-K FKL
                 # (SEMANTIC OVERLOAD: both ride in the student/teacher channels; offsets stay raw for decay).
@@ -1953,6 +2080,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         output = {
             "dflash_log_probs": log_probs_by_seq,
             "dflash_loss_mask": loss_mask_by_seq,
+            "dflash_response_offsets": response_offsets_by_seq,
             "dflash_opd_valid_anchor_count": log_probs_by_seq.new_tensor(opd_metrics["valid_anchor_count"]),
             "dflash_opd_skipped_sample_count": log_probs_by_seq.new_tensor(opd_metrics["skipped_sample_count"]),
             "dflash_opd_empty_reject_sample_count": log_probs_by_seq.new_tensor(
