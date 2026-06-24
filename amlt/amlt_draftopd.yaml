@@ -61,7 +61,7 @@ env_defaults:
   # ---- Checkpoint storage: the trainer writes to node-local FAST disk (LOCAL_CKPT_ROOT) and a background
   #      loop mirrors to the durable blob copy. Saving FSDP shards straight to blob-fuse is slow and the
   #      post-save distributed barrier (nccl_timeout) can crash the job. See docs/checkpoint_local_to_blob.md.
-  LOCAL_CKPT_ROOT: /tmp        # node-local fast disk root (override if /tmp is tmpfs / too small)
+  LOCAL_CKPT_ROOT: /scratch    # node-local fast disk root (override per cluster; LOCAL_CKPT = $ROOT/draftopd_ckpt/$EXP)
   CKPT_MIRROR_INTERVAL: 300    # seconds between local->blob mirror passes
   MAX_LOCAL_CKPT_KEEP: 2       # keep last N checkpoints on LOCAL disk (blob keeps the full history)
   # True (default) = original draftopd (reverse KL on the rejected draft token). Set False for a
@@ -127,8 +127,11 @@ jobs:
       #      trainer.default_local_dir); a background loop (below) mirrors to the durable blob copy
       #      (BLOB_CKPT). See docs/checkpoint_local_to_blob.md. ----
       - export BLOB_CKPT=$${BLOB_CKPT:-$${OUTPUT_ROOT}/checkpoints}
-      - export LOCAL_CKPT=$${LOCAL_CKPT:-${LOCAL_CKPT_ROOT}/draftopd_ckpt/$${AMLT_EXPERIMENT_NAME:-default}}
+      - export LOCAL_CKPT=$${LOCAL_CKPT:-${LOCAL_CKPT_ROOT}/draftopd_ckpt/$${AMLT_EXPERIMENT_NAME:-draftopd}}
       - export CKPT_DIR=$${LOCAL_CKPT}
+      # Create + fail-fast-verify LOCAL_CKPT is writable (LOCAL_CKPT_ROOT must be node-local disk with space),
+      # and log the path + mount so run 1 reveals whether /tmp is a real disk vs a small tmpfs.
+      - 'mkdir -p "$${LOCAL_CKPT}" && touch "$${LOCAL_CKPT}/.wtest" 2>/dev/null && rm -f "$${LOCAL_CKPT}/.wtest" || { echo "[ERR] LOCAL_CKPT not writable: $${LOCAL_CKPT} -- set LOCAL_CKPT_ROOT to a node-local fast disk"; exit 1; }; echo "[ckpt] LOCAL_CKPT=$${LOCAL_CKPT}  BLOB_CKPT=$${BLOB_CKPT}"; df -h "$${LOCAL_CKPT}" | tail -1'
       - export WANDB_DIR=$${WANDB_DIR:-$${OUTPUT_ROOT}/wandb}
       # ---- W&B key (kept off the public repo; offline by default — see header note #3) ----
       - set +x 2>/dev/null; source $${AZURE_STORAGE_ROOT}/secret/wandb_key.sh 2>/dev/null || true
