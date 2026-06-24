@@ -45,9 +45,6 @@ distillation_loss:
   # Token weight for DFLASH rejected draft suffix tokens.
   rejected_draft_stream_weight: 1.0
 
-  # Whether rejected draft suffix tokens always use the sampled reverse-KL estimator.
-  rejected_draft_use_reverse_kl: false
-
   # Whether to decay rejected draft token weights by their position in a draft block.
   rejected_draft_position_decay_enabled: true
 

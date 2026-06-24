@@ -437,7 +437,7 @@ def test_response_loss_fn_consumes_model_topk_tv():
 def _reject_cfg(reject_token_mode, post_reject_mode, decay):
     return SimpleNamespace(
         loss_mode="k3", loss_max_clamp=None, log_prob_min_clamp=None, use_policy_gradient=False,
-        reverse_kl_weight=0.0, forward_kl_weight=1.0, rejected_draft_use_reverse_kl=True,
+        reverse_kl_weight=0.0, forward_kl_weight=1.0,
         response_loss_mode="bernoulli_fkl", reject_accept_loss_mode="bernoulli_fkl",
         reject_token_loss_mode=reject_token_mode, post_reject_loss_mode=post_reject_mode,
         rejected_draft_position_decay_enabled=True, rejected_draft_position_decay=decay,

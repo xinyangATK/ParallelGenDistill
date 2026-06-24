@@ -175,9 +175,11 @@ def test_paradistill_loss_uses_flat_slot_count_with_overlap_and_ignores_polluted
         loss_max_clamp=None,
         log_prob_min_clamp=None,
         use_policy_gradient=False,
-        reverse_kl_weight=0.0,
+        reverse_kl_weight=0.0,  # response stream = Bernoulli forward only; does NOT touch the reverse stream
         forward_kl_weight=1.0,
-        rejected_draft_use_reverse_kl=True,
+        # No rejected_draft_use_reverse_kl: the unified reverse stream uses the per-region reject mode, which
+        # defaults to reverse_kl => k3 on the fresh samples. (Regression: previously this needed the now-removed
+        # rejected_draft_use_reverse_kl=True, else the reverse stream silently became Bernoulli forward KL.)
         rejected_draft_position_decay_enabled=False,
         response_stream_weight=1.0,
         rejected_draft_stream_weight=1.0,
@@ -238,7 +240,7 @@ def test_paradistill_loss_applies_offset_decay_and_normalizes_by_decay_weight():
         use_policy_gradient=False,
         reverse_kl_weight=0.0,
         forward_kl_weight=1.0,
-        rejected_draft_use_reverse_kl=True,
+        # Unified reverse stream: per-region reject mode defaults to reverse_kl => k3 (no special flag).
         rejected_draft_position_decay_enabled=True,
         rejected_draft_position_decay=decay,
         response_stream_weight=1.0,

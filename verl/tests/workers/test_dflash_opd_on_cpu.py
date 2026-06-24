@@ -858,7 +858,6 @@ def test_rejected_draft_can_use_reverse_kl_while_response_uses_forward_kl():
         forward_kl_weight=1.0,
         response_stream_weight=1.0,
         rejected_draft_stream_weight=2.0,
-        rejected_draft_use_reverse_kl=True,
         rejected_draft_position_decay_enabled=True,
         rejected_draft_position_decay=0.5,
     )

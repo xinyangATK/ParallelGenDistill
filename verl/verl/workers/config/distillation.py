@@ -48,8 +48,6 @@ class DistillationLossConfig(BaseConfig):
         Token weight for the standard response-token OPD stream.
     rejected_draft_stream_weight (float):
         Token weight for DFLASH rejected draft suffix tokens.
-    rejected_draft_use_reverse_kl (bool):
-        Whether to always use the sampled reverse-KL estimator for rejected draft suffix tokens.
     rejected_draft_position_decay_enabled (bool):
         Whether to decay rejected draft token loss weights by draft offset.
     rejected_draft_position_decay (float):
@@ -85,7 +83,6 @@ class DistillationLossConfig(BaseConfig):
     forward_kl_weight: float = 0.0
     response_stream_weight: float = 1.0
     rejected_draft_stream_weight: float = 1.0
-    rejected_draft_use_reverse_kl: bool = False
     rejected_draft_position_decay_enabled: bool = True
     rejected_draft_position_decay: float = 0.9
     # paradistill: the reverse stream is fresh on-policy draft samples co-located with the
