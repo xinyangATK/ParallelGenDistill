@@ -12,7 +12,7 @@
 #   (2) REVERSE-TOKEN SOURCE: verl_dflash_onpolicy_reverse_enabled=True (fresh y_hat + teacher verify-forward).
 # top-K support is the teacher/student union (TOPK_FKL_*_K both > 0; student_k>0 REQUIRED for topk_reverse_kl).
 #
-# paradistill knobs:    DRAFT_SAMPLE_TEMPERATURE (T_draft for the fresh draft block), DRAFT_SAMPLE_SEED
+# paradistill knobs:    DRAFT_SAMPLE_TEMPERATURE (T_draft; 0 = GREEDY argmax draftopd-style, >0 = sample), DRAFT_SAMPLE_SEED
 #                (<0 = fresh each step; >=0 = reproducible per forward).
 # Anchor knobs:  ANCHOR_MODE (stride_k | sampled), ANCHOR_SAMPLE_RATIO, ANCHOR_SEED.
 # Loss / training knobs are passed straight through to run_qwen_gsm8k_forward-ins.sh via the environment.

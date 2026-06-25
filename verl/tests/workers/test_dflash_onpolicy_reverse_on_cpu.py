@@ -49,6 +49,22 @@ def test_sample_draft_tokens_deterministic_and_in_vocab():
     ).numel() == 0
 
 
+def test_sample_draft_tokens_greedy_at_temperature_zero():
+    # T_draft=0 -> greedy argmax(q) (draftopd-style), deterministic, generator-independent.
+    torch.manual_seed(0)
+    student = _student()
+    draft_hidden = torch.randn(2, 5, 4)
+    emb = torch.nn.Linear(4, 9, bias=False)
+    b_idx = torch.tensor([0, 0, 1], dtype=torch.long)
+    d_idx = torch.tensor([1, 3, 2], dtype=torch.long)
+    out = student._sample_draft_tokens(
+        draft_hidden=draft_hidden, output_embeddings=emb, batch_indices=b_idx, draft_indices=d_idx,
+        sample_temperature=0.0, chunk_size=2,  # greedy ignores the generator
+    )
+    expected = emb(draft_hidden[b_idx, d_idx, :]).float().argmax(dim=-1)
+    assert torch.equal(out, expected)
+
+
 def test_topk_reverse_kl_teacher_hidden_matches_pre_projected_logits():
     # The teacher-hidden path (project per chunk via teacher_output_embeddings) must equal feeding
     # pre-projected teacher logits -- this is what lets the verify-forward hidden feed the reverse KL.

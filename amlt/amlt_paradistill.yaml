@@ -47,7 +47,7 @@ env_defaults:
   # draft-prefix flow runs ONLY on the reject-position anchors (clean reject-anchored paradistill).
   REJECTED_DRAFT_REVERSE: True
   ANCHOR_SAMPLE_RATIO: 0.2              # only used when ANCHOR_MODE=sampled
-  DRAFT_SAMPLE_TEMPERATURE: 1.0         # T_draft for the fresh on-policy draft block
+  DRAFT_SAMPLE_TEMPERATURE: 0.         # T_draft for the fresh draft block: 0 = GREEDY argmax (draftopd-style); >0 = sample
   # Top-K support for BOTH streams (response top-K forward KL + reverse top-K reverse KL). Both > 0 -> union
   # (S = teacher top-K_t ∪ student top-K_s); student_k > 0 is REQUIRED for topk_reverse_kl.
   TOPK_FKL_TEACHER_K: 16

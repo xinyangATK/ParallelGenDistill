@@ -441,14 +441,16 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         return str(value).lower() in {"1", "true", "yes", "on"}
 
     def _get_draft_sample_temperature(self) -> float:
-        """T_draft for drawing fresh on-policy samples y_hat_j ~ q. 1.0 gives genuine q-samples (an
-        unbiased k3 reverse-KL estimate); other values trade bias for exploration."""
+        """T_draft for drawing the fresh on-policy block y_hat_j ~ q. 1.0 gives genuine q-samples; other
+        positive values trade bias for exploration. **0.0 = GREEDY** (argmax of q, deterministic) -- the
+        same proposal draftopd's draft would make -- so the teacher verify-forward conditions on the draft's
+        greedy trajectory (the reverse loss is still the top-K distributional reverse KL, not single-token)."""
         value = getattr(self.config, "verl_dflash_draft_sample_temperature", None)
         if value is None:
             value = os.getenv("VERL_DFLASH_DRAFT_SAMPLE_TEMPERATURE", "1.0")
         value = float(value)
-        if value <= 0.0:
-            raise ValueError(f"verl_dflash_draft_sample_temperature must be positive, got {value}.")
+        if value < 0.0:
+            raise ValueError(f"verl_dflash_draft_sample_temperature must be >= 0 (0 = greedy), got {value}.")
         return value
 
     def _get_draft_sample_seed(self) -> int:
@@ -636,22 +638,28 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         chunk_size: int,
         generator: Optional[torch.Generator] = None,
     ) -> torch.LongTensor:
-        """Draw one fresh on-policy token ``y_hat ~ q_phi`` (at ``sample_temperature``) per draft slot.
+        """Draw one fresh on-policy token ``y_hat`` per draft slot. ``sample_temperature > 0`` samples
+        ``y_hat ~ q_phi^(1/T)``; ``sample_temperature == 0`` takes the GREEDY argmax of ``q_phi`` (the same
+        proposal draftopd's draft makes), deterministic and generator-independent.
 
-        Returns ``(N,)`` sampled token ids for the slots ``(batch_indices, draft_indices)``; no gradient
-        (the samples only define the teacher's verify-forward conditioning, the loss grad flows through the
-        draft head's own distribution, computed separately in the top-K reverse KL).
+        Returns ``(N,)`` token ids for the slots ``(batch_indices, draft_indices)``; no gradient (the samples
+        only define the teacher verify-forward's conditioning -- the loss grad flows through the draft head's
+        own distribution, computed separately in the top-K reverse KL).
         """
         if batch_indices.numel() == 0:
             return batch_indices.new_empty((0,), dtype=torch.long)
         selected_hidden = draft_hidden[batch_indices, draft_indices, :]
+        greedy = sample_temperature <= 0.0
         sample_chunks: list[torch.Tensor] = []
         with torch.no_grad():
             for start in range(0, selected_hidden.shape[0], chunk_size):
                 end = min(start + chunk_size, selected_hidden.shape[0])
                 logits = output_embeddings(selected_hidden[start:end]).float()
-                probs = F.softmax(logits / sample_temperature, dim=-1)
-                sample_chunks.append(torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1))
+                if greedy:
+                    sample_chunks.append(logits.argmax(dim=-1))  # T=0 -> greedy (draftopd-style argmax)
+                else:
+                    probs = F.softmax(logits / sample_temperature, dim=-1)
+                    sample_chunks.append(torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1))
         return torch.cat(sample_chunks, dim=0)
 
     @staticmethod
