@@ -42,7 +42,10 @@ env_defaults:
 
   # ---- Paradistill knobs ----
   ONPOLICY_REVERSE: True               # True = forward + draft-prefix reverse; False = FORWARD-ONLY ablation
-  ANCHOR_MODE: sampled                 # stride_k | sampled
+  ANCHOR_MODE: sampled                 # stride_k | sampled | reject (reject = anchor AT each SD reject position)
+  # Only matters when ANCHOR_MODE=reject: False drops the rollout-reject anchor merge so the fresh-sample
+  # draft-prefix flow runs ONLY on the reject-position anchors (clean reject-anchored paradistill).
+  REJECTED_DRAFT_REVERSE: True
   ANCHOR_SAMPLE_RATIO: 0.2              # only used when ANCHOR_MODE=sampled
   DRAFT_SAMPLE_TEMPERATURE: 1.0         # T_draft for the fresh on-policy draft block
   # Top-K support for BOTH streams (response top-K forward KL + reverse top-K reverse KL). Both > 0 -> union
@@ -111,6 +114,7 @@ jobs:
       # ---- paradistill knobs ----
       - export ONPOLICY_REVERSE=${ONPOLICY_REVERSE}
       - export ANCHOR_MODE=${ANCHOR_MODE}
+      - export REJECTED_DRAFT_REVERSE=${REJECTED_DRAFT_REVERSE}
       - export ANCHOR_SAMPLE_RATIO=${ANCHOR_SAMPLE_RATIO}
       - export DRAFT_SAMPLE_TEMPERATURE=${DRAFT_SAMPLE_TEMPERATURE}
       - export TOPK_FKL_TEACHER_K=${TOPK_FKL_TEACHER_K}

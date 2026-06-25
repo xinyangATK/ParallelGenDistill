@@ -51,6 +51,13 @@ RESUME_MODE=${RESUME_MODE:-disable}
 # ONPOLICY_REVERSE=True (default): full paradistill (response forward-KL + fresh on-policy reverse-KL).
 # ONPOLICY_REVERSE=False: FORWARD-ONLY ablation -- only the response Bernoulli forward-KL on y_j; no fresh
 # sampling AND the rollout-reject reverse stream is zeroed (rejected_draft_stream_weight=0).
+# Reverse-stream weight for the on-policy reverse loss. paradistill's reverse value rides in the
+# rejected-draft channel, so it is gated by rejected_draft_stream_weight. CRITICAL: force it nonzero here so
+# it OVERRIDES forward-ins.sh, which sets rejected_draft_stream_weight=0.0 whenever REJECTED_DRAFT_REVERSE
+# is false -- that flag is meant for draftopd's rollout-reject reverse and would otherwise silently ZERO
+# paradistill's on-policy reverse loss (while still paying its compute). Decoupling them lets
+# REJECTED_DRAFT_REVERSE=False cleanly drop only the inert segment-0 model blocks without killing the loss.
+REJECTED_DRAFT_STREAM_WEIGHT=${REJECTED_DRAFT_STREAM_WEIGHT:-1.0}
 ONPOLICY_REVERSE=${ONPOLICY_REVERSE:-True}
 case "${ONPOLICY_REVERSE,,}" in
     true | 1 | yes | on)
@@ -59,6 +66,7 @@ case "${ONPOLICY_REVERSE,,}" in
             ++actor_rollout_ref.model.override_config.verl_dflash_draft_sample_temperature="${DRAFT_SAMPLE_TEMPERATURE}"
             ++actor_rollout_ref.model.override_config.verl_dflash_draft_sample_seed="${DRAFT_SAMPLE_SEED}"
             distillation.distillation_loss.onpolicy_reverse_enabled=True
+            distillation.distillation_loss.rejected_draft_stream_weight="${REJECTED_DRAFT_STREAM_WEIGHT}"
         )
         ;;
     *)
