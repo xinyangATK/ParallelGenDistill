@@ -57,6 +57,10 @@ ENABLE_THINK="${ENABLE_THINK:-false}"
 ADD_BASE="${ADD_BASE:-false}"
 ATTENTION_BACKENDS="${ATTENTION_BACKENDS:-fa3}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8192}"
+# Sampling temperature for the bench (passed to benchmark_sglang.py --temp). 0 = greedy/deterministic
+# (top_p=1.0, top_k=1); >0 = sampling (top_p=0.95, top_k=20). It is the TARGET/output sampling temperature
+# (the draft always proposes top-1: DFLASH forces speculative_eagle_topk=1).
+EVAL_TEMP="${EVAL_TEMP:-0.0}"
 TP_SIZE="${TP_SIZE:-1}"
 MEM_FRACTION="${MEM_FRACTION:-0.75}"
 REUSE_EXTRACTED="${REUSE_EXTRACTED:-true}"
@@ -153,6 +157,7 @@ while [ "${i}" -lt "${total}" ]; do
       echo "    enable_think: ${ENABLE_THINK}"
       echo "    attention_backends: ${ATTENTION_BACKENDS}"
       echo "    max_new_tokens: ${MAX_NEW_TOKENS}"
+      echo "    temp: ${EVAL_TEMP}"
       echo "    tp_size: ${TP_SIZE}"
       echo "    mem_fraction_static: ${MEM_FRACTION}"
     } >> "${cfg}"

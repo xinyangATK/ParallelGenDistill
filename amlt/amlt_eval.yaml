@@ -42,6 +42,11 @@ env_defaults:
   # ---- Datasets (shared by the data-prep step and the eval) ----
   DATASETS_CSV: "gsm8k:128,math500:128"
 
+  # ---- Sampling temperature for the bench (-> benchmark_sglang.py --temp). 0 = greedy/deterministic
+  #      (top_p=1.0, top_k=1); >0 = sampling (top_p=0.95, top_k=20). It tempers the TARGET/output
+  #      distribution; the draft always proposes top-1 (DFLASH forces speculative_eagle_topk=1). ----
+  EVAL_TEMP: 0.0
+
   # ---- Ablation
   REJECTED_DRAFT_POSITION_DECAY_ENABLED: True   # no position decay on rejected token d for now
 
@@ -94,6 +99,7 @@ jobs:
       # ---- Wave width follows the requested SKU; DATASETS_CSV feeds both steps below ----
       - export NUM_GPU=${GPUS}
       - export DATASETS_CSV="${DATASETS_CSV}"
+      - export EVAL_TEMP=${EVAL_TEMP}
       - export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED}
       # ---- Eval experiment name -> suffixed onto the report dir (eval_sglang_<EXP_NAME>) ----
       - export EXP_NAME=$${AMLT_EXPERIMENT_NAME}
