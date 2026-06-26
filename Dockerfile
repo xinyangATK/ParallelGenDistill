@@ -99,12 +99,5 @@ RUN wget -nv https://github.com/Dao-AILab/flash-attention/releases/download/v2.8
 COPY verl/ ./verl/
 RUN cd verl && pip install --no-deps -e .
 
-# --- 6. Pin transformers to the sglang-pinned, known-good version. verl/requirements.txt leaves
-#     `transformers` UNPINNED, so a cache-busted rebuild can resolve to a NEWER transformers that dropped
-#     names verl imports (e.g. MistralForSequenceClassification -> ImportError at startup). Force 4.57.1 as
-#     the LAST pip word so the image never drifts off it. ---
-RUN pip install --no-cache-dir "transformers==4.57.1"
-
-# Fail the build early if the core stack can't import (CPU-only check) -- includes the transformers symbol
-# whose drift broke the rebuild, so a bad pin fails HERE at build time, not at job startup.
-RUN python -c "import torch, verl; from transformers import MistralForSequenceClassification; import flash_attn.bert_padding; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+# Fail the build early if the core stack can't import (CPU-only check).
+RUN python -c "import torch, verl; import flash_attn.bert_padding; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
