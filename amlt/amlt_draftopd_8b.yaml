@@ -1,0 +1,153 @@
+description: Draft-OPD 8B (Qwen3-8B + Qwen3-8B-DFlash-b16, no sftwarmup)
+# ---------------------------------------------------------------------------
+# 8B variant of amlt_draftopd.yaml. Same draftopd baseline (Bernoulli forward KL + reverse KL on the
+# rejected draft token, reject anchors, offset decay) but on Qwen3-8B, with the memory fixes 8B needs:
+# FSDP CPU offload + a higher SGLang mem fraction (the 4B settings OOM -- the composed student is ~9.24B
+# and the colocated rollout SGLang can't get its KV pool). These live in run_qwen_gsm8k_draftopd_8b.sh.
+#
+# Usage (from the repo root, in your `amlt` conda env):
+#   amlt run amlt/amlt_draftopd_8b.yaml <experiment_name>
+# Override knobs at submit, e.g.:
+#   TEACHER_GPU_MEMORY_UTILIZATION=0.6 amlt run amlt/amlt_draftopd_8b.yaml draftopd8b_memhigh --yes
+#   PARAM_OFFLOAD=False amlt run amlt/amlt_draftopd_8b.yaml draftopd8b_nooffload --yes
+#
+# Image / data / W&B / checkpoint-to-blob setup is identical to amlt_draftopd.yaml -- see that file's
+# header notes #1-#3. Job name stays draftopd_dflash_opd so amlt_eval.yaml's TRAIN_JOB_NAME default matches.
+# ---------------------------------------------------------------------------
+
+env_defaults:
+  SLA: Premium                 # Premium for guaranteed A100-80G capacity
+  NODES: 1
+  GPUS: 8                       # (GPUS-TEACHER_WORLD_SIZE) student + TEACHER_WORLD_SIZE teacher, one node
+  MEM: 80                       # A100-80G
+  NVLINK_SUFFIX: "-NvLink"      # "-NvLink" for GPUS=8; "" for GPUS in {1,2,4}
+  TEACHER_WORLD_SIZE: 1         # teacher SGLang inference-pool GPUs; the student gets the rest
+
+  # ---- Models (HF ids, auto-cached into $HF_HOME; or blob paths) ----
+  MAIN_MODEL_PATH: Qwen/Qwen3-8B
+  DRAFT_MODEL_PATH: z-lab/Qwen3-8B-DFlash-b16    # warm-start; swap for your own initial draft
+
+  # ---- 8B memory fixes (consumed by run_qwen_gsm8k_draftopd_8b.sh) ----
+  # FSDP CPU offload frees the student GPUs for the colocated rollout SGLang (key 8B fix; 4B ran without it).
+  PARAM_OFFLOAD: True
+  OPTIMIZER_OFFLOAD: True
+  # Rollout + teacher SGLang mem fraction (4B used 0.2; 8B weights ~16GB + KV need more). Lower if the train
+  # phase OOMs; raise if the rollout KV pool is too small.
+  TEACHER_GPU_MEMORY_UTILIZATION: 0.5
+
+  # ---- Training knobs (read by run_qwen_gsm8k_forward-ins.sh) ----
+  LR: 3e-4
+  MAX_RESPONSE_LENGTH: 2048
+  DISTILLATION_LOSS_MODE: k3
+  FORWARD_KL_WEIGHT: 1.0
+  REVERSE_KL_WEIGHT: 0.0
+  RESUME_MODE: auto
+  # ---- Checkpoint storage: trainer writes node-local fast disk; a background loop mirrors to blob. ----
+  LOCAL_CKPT_ROOT: /scratch    # node-local fast disk root (LOCAL_CKPT = $ROOT/draftopd_ckpt/$EXP)
+  CKPT_MIRROR_INTERVAL: 300    # seconds between local->blob mirror passes
+  MAX_LOCAL_CKPT_KEEP: 2       # keep last N checkpoints on LOCAL disk (blob keeps the full history)
+  # True (default) = original draftopd (reverse KL on the rejected draft token). False = forward-only.
+  REJECTED_DRAFT_REVERSE: True
+  # ---- Per-region loss selection (defaults reproduce original draftopd baseline). ----
+  RESPONSE_LOSS_MODE: bernoulli_fkl
+  REJECT_ACCEPT_LOSS_MODE: bernoulli_fkl
+  REJECT_TOKEN_LOSS_MODE: reverse_kl
+  POST_REJECT_LOSS_MODE: reverse_kl
+  TOPK_FKL_TEACHER_K: 8        # teacher-side top-K (0 disables the teacher support)
+  TOPK_FKL_STUDENT_K: 8         # student-side top-K (0 disables; both > 0 -> union). REQUIRED > 0 for topk_reverse_kl.
+  RESPONSE_STREAM_WEIGHT: 1.0   # response-stream weight; set 0 to train ONLY reject positions
+  REJECTED_DRAFT_POSITION_DECAY_ENABLED: True
+  REJECTED_DRAFT_POSITION_DECAY: 0.8
+  train_epochs: 8
+
+target:
+  service: sing
+  name: GenAI-Shared-UKSouth2
+  workspace_name: Singularity-GenAI-WS-UKSouth2
+  resource_group: singularity-genai-gpu-uksouth2
+
+code:
+  local_dir: ./                 # upload the repo root (this yaml lives in amlt/); see .amltignore
+
+storage:
+  data:
+    storage_account_name: vigstandard
+    container_name: data
+    mount_dir: /blob
+    is_output: true             # persist checkpoints / wandb / hf cache back to the blob
+
+environment:
+  image: draft-opd/draft-opd:latest   # py3.12 / torch2.9.1+cu128, built from ./Dockerfile. See amlt_draftopd.yaml note #1.
+  username: 44359f3e6e864ddba0853a221be97722
+  registry: 44359f3e6e864ddba0853a221be97722.azurecr.io
+  env:
+    AMLT_DOCKERFILE_TEMPLATE: none
+
+jobs:
+  - name: draftopd_dflash_opd            # same job name as 4B so amlt_eval.yaml TRAIN_JOB_NAME default matches
+    sku: ${NODES}x${MEM}G${GPUS}${NVLINK_SUFFIX}
+    sla_tier: ${SLA}
+    priority: high
+    mpi: False
+    process_count_per_node: 1            # verl spawns its own single-node Ray cluster
+    command:
+      - cd $$AMLT_CODE_DIR
+      # ---- Paths rooted on the mounted blob (checkpoints / cache / logs persist) ----
+      - export AZURE_STORAGE_ROOT=$${AZURE_STORAGE_ROOT:-/blob/t-xinyangliu}
+      - export OUTPUT_ROOT=$${OUTPUT_ROOT:-$${AZURE_STORAGE_ROOT}/outputs/$${AMLT_JOB_NAME}/$${AMLT_EXPERIMENT_NAME}}
+      - export HF_HOME=$${HF_HOME:-$${AZURE_STORAGE_ROOT}/cache/hf}
+      # ---- Checkpoints: trainer writes node-local fast disk; background loop mirrors to blob. ----
+      - export BLOB_CKPT=$${BLOB_CKPT:-$${OUTPUT_ROOT}/checkpoints}
+      - export LOCAL_CKPT=$${LOCAL_CKPT:-${LOCAL_CKPT_ROOT}/draftopd_ckpt/$${AMLT_EXPERIMENT_NAME:-draftopd}}
+      - export CKPT_DIR=$${LOCAL_CKPT}
+      - 'mkdir -p "$${LOCAL_CKPT}" && touch "$${LOCAL_CKPT}/.wtest" 2>/dev/null && rm -f "$${LOCAL_CKPT}/.wtest" || { echo "[ERR] LOCAL_CKPT not writable: $${LOCAL_CKPT} -- set LOCAL_CKPT_ROOT to a node-local fast disk"; exit 1; }; echo "[ckpt] LOCAL_CKPT=$${LOCAL_CKPT}  BLOB_CKPT=$${BLOB_CKPT}"; df -h "$${LOCAL_CKPT}" | tail -1'
+      - export WANDB_DIR=$${WANDB_DIR:-$${OUTPUT_ROOT}/wandb}
+      - set +x 2>/dev/null; source $${AZURE_STORAGE_ROOT}/secret/wandb_key.sh 2>/dev/null || true
+      - export PYTHONUNBUFFERED=1
+      # ---- GPU split: TEACHER_WORLD_SIZE teacher GPUs, the rest for the student ----
+      - export TEACHER_WORLD_SIZE=${TEACHER_WORLD_SIZE}
+      - export STUDENT_WORLD_SIZE=$$(( ${GPUS} - ${TEACHER_WORLD_SIZE} ))
+      # ---- Models + training knobs the entrypoint reads from the environment ----
+      - export MAIN_MODEL_PATH="${MAIN_MODEL_PATH}"
+      - export DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH}"
+      # ---- 8B memory fixes (read by run_qwen_gsm8k_draftopd_8b.sh) ----
+      - export PARAM_OFFLOAD=${PARAM_OFFLOAD}
+      - export OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD}
+      - export TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION}
+      - export MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH}
+      - export LR=${LR}
+      - export DISTILLATION_LOSS_MODE=${DISTILLATION_LOSS_MODE}
+      - export FORWARD_KL_WEIGHT=${FORWARD_KL_WEIGHT}
+      - export REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT}
+      - export RESUME_MODE=${RESUME_MODE}
+      - export REJECTED_DRAFT_REVERSE=${REJECTED_DRAFT_REVERSE}
+      - export RESPONSE_LOSS_MODE=${RESPONSE_LOSS_MODE}
+      - export REJECT_ACCEPT_LOSS_MODE=${REJECT_ACCEPT_LOSS_MODE}
+      - export REJECT_TOKEN_LOSS_MODE=${REJECT_TOKEN_LOSS_MODE}
+      - export POST_REJECT_LOSS_MODE=${POST_REJECT_LOSS_MODE}
+      - export TOPK_FKL_TEACHER_K=${TOPK_FKL_TEACHER_K}
+      - export TOPK_FKL_STUDENT_K=${TOPK_FKL_STUDENT_K}
+      - export stream_weight=${RESPONSE_STREAM_WEIGHT}
+      - export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED}
+      - export REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY}
+      - export train_epochs=${train_epochs}
+      - export EXP_NAME=$${AMLT_EXPERIMENT_NAME:-draftopd}
+      # ---- Data: bundled in the repo (data_prep/), uploaded with the code ----
+      - export TRAIN_JSONL=$${AMLT_CODE_DIR}/data_prep/opd_pool_16k.jsonl
+      - export VAL_DIR=$${VAL_DIR:-$${AMLT_CODE_DIR}/data_prep/val}
+      - export VAL_FILES="['$${VAL_DIR}/aime24.jsonl','$${VAL_DIR}/gsm8k.jsonl','$${VAL_DIR}/math500.jsonl','$${VAL_DIR}/mbpp.jsonl']"
+      - 'test -f "$${TRAIN_JSONL}" || { echo "[ERR] bundled pool missing (data_prep/opd_pool_16k.jsonl not uploaded?): $${TRAIN_JSONL}"; exit 1; }'
+      # ---- Pre-cache HF models with retries (8B target + 8B draft) ----
+      - 'for m in "$${MAIN_MODEL_PATH}" "$${DRAFT_MODEL_PATH}"; do for i in 1 2 3 4 5 6; do hf download "$$m" >/dev/null 2>&1 && break; echo "[hf] download retry $$i/6 for $$m"; sleep $$(( i * 20 )); done; done'
+      # ---- Hydrate: pull ONLY the latest blob checkpoint back to local so RESUME_MODE=auto resumes ----
+      - 'mkdir -p "$${LOCAL_CKPT}" "$${BLOB_CKPT}"; if [ -f "$${BLOB_CKPT}/latest_checkpointed_iteration.txt" ]; then s=$$(cat "$${BLOB_CKPT}/latest_checkpointed_iteration.txt"); echo "[ckpt] hydrate global_step_$${s} blob->local"; cp -r "$${BLOB_CKPT}/global_step_$${s}" "$${LOCAL_CKPT}/" 2>/dev/null || true; cp "$${BLOB_CKPT}/latest_checkpointed_iteration.txt" "$${LOCAL_CKPT}/" 2>/dev/null || true; fi'
+      # ---- Runtime overlay: patch the IMAGE's baked sglang (/workspace/sglang-dflash, which the job imports
+      #      -- NOT the uploaded copy) with the customized_info "IndexError: list index out of range" fix,
+      #      without rebuilding the image. ----
+      - 'REL=sglang/srt/managers/scheduler_output_processor_mixin.py; DST=/workspace/sglang-dflash/python/$${REL}; if [ -f "$${DST}" ] && cp "$${AMLT_CODE_DIR}/sglang-dflash/python/$${REL}" "$${DST}" 2>/dev/null; then rm -f "$$(dirname "$${DST}")/__pycache__/"scheduler_output_processor_mixin.*.pyc 2>/dev/null || true; grep -q "Keep every customized_info key aligned" "$${DST}" && echo "[overlay] patched baked sglang: $${DST}" || echo "[overlay][WARN] cp ran but marker missing in $${DST}"; else echo "[overlay][ERR] cannot write $${DST} (not present or /workspace read-only) -- rebuild the image, else this run keeps the IndexError bug"; fi'
+      # ---- Run the 8B launcher with the background local->blob ckpt mirror (preserve training exit code). ----
+      - 'sync_blob() { cp -ru "$${LOCAL_CKPT}"/global_step_* "$${BLOB_CKPT}/" 2>/dev/null || true; cp -u "$${LOCAL_CKPT}"/latest_checkpointed_iteration.txt "$${BLOB_CKPT}/" 2>/dev/null || true; }; set -m; ( while true; do sync_blob; sleep ${CKPT_MIRROR_INTERVAL}; done ) & CKPT_SYNC_PID=$$!; set +m; if bash verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_draftopd_8b.sh "data.val_files=$${VAL_FILES}" "trainer.max_actor_ckpt_to_keep=${MAX_LOCAL_CKPT_KEEP}"; then rc=0; else rc=$$?; fi; kill -- -$${CKPT_SYNC_PID} 2>/dev/null || true; sync_blob; exit $${rc}'
+    submit_args:
+      env:
+        DATASET_MOUNT_BLOCK_BASED_CACHE_ENABLED: True
+        SHARED_MEMORY_PERCENT: 0.5

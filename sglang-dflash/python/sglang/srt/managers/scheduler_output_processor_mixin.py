@@ -1092,11 +1092,22 @@ class SchedulerOutputProcessorMixin:
                         routed_experts = []
                     routed_experts.append(req.routed_experts)
 
-                if req.customized_info is not None:
-                    for k, v in req.customized_info.items():
-                        if k not in customized_info:
-                            customized_info[k] = []
-                        customized_info[k].append(v[send_token_offset:])
+                # Keep every customized_info key aligned to rids order: one entry per output request. A key
+                # present on only SOME requests in the batch (e.g. dflash_rejected_draft_* on requests that
+                # actually had a draft rejection) MUST get a placeholder for the others -- the tokenizer reads
+                # value_by_req[recv_index] with recv_index = the GLOBAL request index, so a dense (skip-missing)
+                # list desyncs and raises "IndexError: list index out of range" (and silently misaligns the
+                # metadata before that). This surfaces once the draft is good enough that some generations have
+                # zero rejections while others in the same batch do.
+                target_len = len(rids)  # rids already includes this request (appended above)
+                req_ci = req.customized_info or {}
+                for k in req_ci:
+                    customized_info.setdefault(k, [])
+                for k, values in customized_info.items():
+                    if len(values) < target_len - 1:
+                        values.extend([[] for _ in range(target_len - 1 - len(values))])
+                    chunk = req_ci.get(k)
+                    values.append(chunk[send_token_offset:] if chunk is not None else [])
 
             if (
                 req.finished()

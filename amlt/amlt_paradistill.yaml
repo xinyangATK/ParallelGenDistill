@@ -129,6 +129,10 @@ jobs:
       # ---- Pre-cache HF models once (best-effort) ----
       - hf download "${MAIN_MODEL_PATH}" >/dev/null 2>&1 || true
       - hf download "${DRAFT_MODEL_PATH}" >/dev/null 2>&1 || true
+      # ---- Runtime overlay: the job imports sglang from the IMAGE's baked editable install
+      #      (/workspace/sglang-dflash), NOT the uploaded repo copy. Copy the patched file in (fixes the
+      #      customized_info "IndexError: list index out of range" rollout crash) without rebuilding the image. ----
+      - 'REL=sglang/srt/managers/scheduler_output_processor_mixin.py; DST=/workspace/sglang-dflash/python/$${REL}; if [ -f "$${DST}" ] && cp "$${AMLT_CODE_DIR}/sglang-dflash/python/$${REL}" "$${DST}" 2>/dev/null; then rm -f "$$(dirname "$${DST}")/__pycache__/"scheduler_output_processor_mixin.*.pyc 2>/dev/null || true; grep -q "Keep every customized_info key aligned" "$${DST}" && echo "[overlay] patched baked sglang: $${DST}" || echo "[overlay][WARN] cp ran but marker missing in $${DST}"; else echo "[overlay][ERR] cannot write $${DST} (not present or /workspace read-only) -- rebuild the image, else this run keeps the IndexError bug"; fi'
       # ---- Run paradistill ----
       - bash verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_paradistill.sh "data.val_files=$${VAL_FILES}"
     submit_args:
