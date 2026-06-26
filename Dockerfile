@@ -99,5 +99,14 @@ RUN wget -nv https://github.com/Dao-AILab/flash-attention/releases/download/v2.8
 COPY verl/ ./verl/
 RUN cd verl && pip install --no-deps -e .
 
-# Fail the build early if the core stack can't import (CPU-only check).
-RUN python -c "import torch, verl; import flash_attn.bert_padding; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+# --- 6. Pin scipy to a numpy<2.0-compatible version. verl/requirements.txt pins numpy<2.0 (1.26.4, where
+#     np.long was removed) but leaves scipy UNPINNED, so a cache-busted rebuild can pull a newer, numpy>=2.0-era
+#     scipy whose scipy/sparse/_sputils.py uses np.long -> `AttributeError: module 'numpy' has no attribute
+#     'long'` at import. That crash cascades into transformers' lazy model discovery and surfaces as
+#     `ImportError: cannot import name 'MistralForSequenceClassification'` at verl startup. 1.17.1 matches the
+#     known-good local env. ---
+RUN pip install --no-cache-dir "scipy==1.17.1" "numpy<2.0"
+
+# Fail the build early if the core stack can't import (CPU-only check). Imports scipy.sparse (the np.long
+# crash site) + the transformers symbol the scipy crash was hiding, so a bad scipy fails HERE, not at job start.
+RUN python -c "import scipy.sparse.linalg, torch, verl; from transformers import MistralForSequenceClassification; import flash_attn.bert_padding; print('OK torch', torch.__version__, 'scipy', __import__('scipy').__version__)"
