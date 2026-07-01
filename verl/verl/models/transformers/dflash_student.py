@@ -37,9 +37,9 @@ DFLASH_ATTENTION_IMPL_IDS = {
 }
 
 # Loss modes that compute an in-model top-K divergence from the teacher's full-vocab logits (need the teacher
-# logits retained). Forward regions: topk_fkl / topk_tv. Reject regions: topk_fkl / topk_reverse_kl.
+# logits retained). Forward regions: topk_fkl / topk_tv. Reject regions: topk_fkl / topk_tv / topk_reverse_kl.
 _TOPK_FORWARD_MODES = ("topk_fkl", "topk_tv")
-_TOPK_REJECT_MODES = ("topk_fkl", "topk_reverse_kl")
+_TOPK_REJECT_MODES = ("topk_fkl", "topk_tv", "topk_reverse_kl")
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -462,10 +462,13 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         return int(value)
 
     # Per-region loss-mode getters. Forward regions (response, reject-accept): bernoulli_fkl | topk_fkl |
-    # topk_tv; reject regions (reject-token, post-reject): reverse_kl | topk_fkl | topk_reverse_kl.
+    # topk_tv; reject regions (reject-token, post-reject): reverse_kl | topk_fkl | topk_tv | topk_reverse_kl |
+    # off (disable that region -- its slots contribute NO loss and stay unmasked/uncounted). E.g.
+    # reject_token_loss_mode=off drops the reject-boundary duplicate that reject_accept already covers under a
+    # symmetric top-K loss, so each block position is scored exactly once.
     # Defaults = original draftopd.
     _FORWARD_REGION_MODES = ("bernoulli_fkl", "topk_fkl", "topk_tv")
-    _REJECT_REGION_MODES = ("reverse_kl", "topk_fkl", "topk_reverse_kl")
+    _REJECT_REGION_MODES = ("reverse_kl", "topk_fkl", "topk_tv", "topk_reverse_kl", "off", "none")
 
     def _get_region_loss_mode(self, config_key: str, env_key: str, default: str, allowed: tuple) -> str:
         value = getattr(self.config, config_key, None)
@@ -1331,11 +1334,17 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         rev_items: list[tuple[int, int]] = []
         rev_teacher: list[float] = []
         # one (batch, draft, rows, items) bucket per top-K mode keyed by the in-model helper.
-        topk_fns = {"topk_fkl": self._compute_topk_forward_kl, "topk_reverse_kl": self._compute_topk_reverse_kl}
+        topk_fns = {
+            "topk_fkl": self._compute_topk_forward_kl,
+            "topk_tv": self._compute_topk_tv,
+            "topk_reverse_kl": self._compute_topk_reverse_kl,
+        }
         topk_buckets = {m: {"batch": [], "draft": [], "rows": [], "items": []} for m in topk_fns}
         for batch_idx, item_idx, block_idx, offset, token_id, full_anchor, valid_len in candidates:
             is_reject_token = offset == min_offset_by_anchor[batch_idx][full_anchor]
             mode = reject_token_mode if is_reject_token else post_reject_mode
+            if mode in ("off", "none"):
+                continue  # region disabled -> slot adds no loss and stays unmasked (excluded from the count)
             draft_index = block_idx * draft_block_size + offset
             if mode in topk_buckets:
                 if full_anchor + offset >= valid_len:
@@ -1679,7 +1688,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             )
         if (reject_token_topk or post_reject_topk) and response_anchor_mode != "reject" and not onpolicy_reverse_enabled:
             raise NotImplementedError(
-                "draftopd reject-region top-K losses (reject_token/post_reject loss_mode=topk_fkl|topk_reverse_kl) "
+                "draftopd reject-region top-K losses (reject_token/post_reject loss_mode=topk_fkl|topk_tv|topk_reverse_kl) "
                 "require reject-mode anchors (free anchors are only supported via on-policy reverse, the paradistill "
                 "draft-prefix path)."
             )

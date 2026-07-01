@@ -683,10 +683,10 @@ def distillation_loss(
         # onpolicy_reverse_enabled=False) OR a fresh on-policy sample y_hat ~ q drawn in the model
         # (paradistill, onpolicy_reverse_enabled=True). Both select the loss by region via
         # reject_token_loss_mode / post_reject_loss_mode: reverse_kl -> k3 on (log q, log p), or an in-model
-        # top-K loss precomputed in the student channel (topk_fkl / topk_reverse_kl). paradistill is a single
+        # top-K loss precomputed in the student channel (topk_fkl / topk_tv / topk_reverse_kl). paradistill is a single
         # reverse region: top-K is excluded for it (model raises), so both reject regions are reverse_kl and
         # fall into the both-reverse branch below -> a uniform k3 over the fresh samples. Decay applies below.
-        reject_direct_modes = ("topk_fkl", "topk_reverse_kl")
+        reject_direct_modes = ("topk_fkl", "topk_tv", "topk_reverse_kl")
         reject_token_direct = str(getattr(loss_config, "reject_token_loss_mode", "reverse_kl")) in reject_direct_modes
         post_reject_direct = str(getattr(loss_config, "post_reject_loss_mode", "reverse_kl")) in reject_direct_modes
         if reject_token_direct and post_reject_direct:
@@ -800,8 +800,8 @@ def distillation_loss(
                 "opd_rejected_draft_batch_effective_num_tokens"
             )
             reject_is_topk = (
-                str(getattr(loss_config, "reject_token_loss_mode", "reverse_kl")) in ("topk_fkl", "topk_reverse_kl")
-                or str(getattr(loss_config, "post_reject_loss_mode", "reverse_kl")) in ("topk_fkl", "topk_reverse_kl")
+                str(getattr(loss_config, "reject_token_loss_mode", "reverse_kl")) in ("topk_fkl", "topk_tv", "topk_reverse_kl")
+                or str(getattr(loss_config, "post_reject_loss_mode", "reverse_kl")) in ("topk_fkl", "topk_tv", "topk_reverse_kl")
             )
             if loss_config.onpolicy_reverse_enabled or reject_is_topk:
                 # paradistill / draftopd reject top-K FKL build their own (block, offset) slots (and top-K

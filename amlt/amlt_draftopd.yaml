@@ -78,8 +78,8 @@ env_defaults:
   REJECT_ACCEPT_LOSS_MODE: bernoulli_fkl
   REJECT_TOKEN_LOSS_MODE: reverse_kl
   POST_REJECT_LOSS_MODE: reverse_kl
-  TOPK_FKL_TEACHER_K: 8        # teacher-side top-K (0 disables the teacher support)
-  TOPK_FKL_STUDENT_K: 8         # student-side top-K (0 disables; both > 0 -> union). REQUIRED > 0 for topk_reverse_kl.
+  TOPK_FKL_TEACHER_K: 16        # teacher-side top-K (0 disables the teacher support)
+  TOPK_FKL_STUDENT_K: 16         # student-side top-K (0 disables; both > 0 -> union). REQUIRED > 0 for topk_reverse_kl.
   RESPONSE_STREAM_WEIGHT: 1.0   # response-stream weight; set 0 to train ONLY reject positions
   # Reject-stream per-offset weighting: weight each rejected/FKL slot by DECAY^(offset-1) (offset = draft
   # head depth). Applies to BOTH the baseline reverse stream and the Request 2 top-K FKL. ENABLED=False ->

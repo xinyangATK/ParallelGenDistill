@@ -270,6 +270,47 @@ def test_collect_rejected_draft_topk_fkl_uses_realized_teacher_and_drops_oob():
     assert student_t[0, 1] == 0.0
 
 
+def test_collect_rejected_draft_topk_tv_uses_realized_teacher_and_drops_oob():
+    # Full-block topk_tv: reject_token/post_reject = topk_tv, so the reject stream carries the in-model top-K
+    # TOTAL-VARIATION at the realized teacher position (same reject geometry / OOB-drop as the topk_fkl case).
+    # Slot A (anchor 2, offset 1) -> draft slot 1, realized teacher row 2 -> kept; slot B realized target OOB.
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    torch.manual_seed(0)
+    hidden, vocab, K = 4, 6, 3
+    draft_hidden = torch.randn(1, 2 * K, hidden)
+    teacher_logits = torch.randn(1, 6, vocab)
+    out = torch.nn.Linear(hidden, vocab, bias=False)
+    long = lambda v: torch.tensor(v, dtype=torch.long)  # noqa: E731
+    student_t, teacher_t, mask_t, is_rt = student._collect_rejected_draft_log_probs(
+        draft_hidden=draft_hidden,
+        output_embeddings=out,
+        prompt_lengths=long([2]),
+        response_lengths=long([4]),
+        anchor_positions=long([[2, 5]]),
+        block_keep_mask=torch.tensor([[True, True]]),
+        draft_block_size=K,
+        lm_head_chunk_size=64,
+        max_tokens_per_sample=None,
+        rejected_draft_anchor_indices=long([[0, 3]]),
+        rejected_draft_offsets=long([[1, 2]]),
+        rejected_draft_token_ids=long([[3, 2]]),
+        rejected_draft_teacher_logprobs=None,           # unused for the direct-value TV path
+        rejected_draft_mask=torch.tensor([[True, True]]),
+        reject_token_mode="topk_tv",
+        post_reject_mode="topk_tv",
+        teacher_logits=teacher_logits,
+        topk_fkl_mode="teacher",
+        topk_fkl_teacher_k=2,
+    )
+    assert mask_t.tolist() == [[True, False]]           # slot B dropped (realized target out of bounds)
+    assert teacher_t.abs().sum() == 0                   # teacher channel unused; TV value rides in student chan
+    expected = _manual_topk_tv(
+        draft_hidden, teacher_logits, out, torch.tensor([0]), torch.tensor([1]), torch.tensor([2]), "teacher", k=2
+    )
+    assert torch.allclose(student_t[0, 0], expected[0], atol=1e-6)  # TV at draft slot 1 vs teacher row 2
+    assert student_t[0, 1] == 0.0
+
+
 def test_collect_rejected_draft_baseline_path_unchanged():
     # Default reverse_kl regions keep the baseline reverse-stream behavior: student = log q(d) at the slot,
     # teacher = the cached scalar log p(d); the single slot is the reject token (min offset for its anchor).
@@ -347,6 +388,48 @@ def test_collect_rejected_draft_is_reject_token_min_offset_and_mixed_regions():
         )
         assert torch.allclose(student_t[0, col], exp[0], atol=1e-6)
         assert teacher_t[0, col] == 0.0
+
+
+def test_collect_rejected_draft_reject_token_off_skips_boundary_keeps_postreject():
+    # reject_token_loss_mode=off drops the reject-BOUNDARY slot (min offset) entirely -- reject_accept already
+    # covers it in the response stream -- while post_reject=topk_tv keeps the discarded-suffix (deep) heads.
+    # One anchor (full pos 2), K=4, offsets 1(=reject token),2,3; valid_len=2+5=7 so targets 3,4,5 in bounds.
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    torch.manual_seed(2)
+    hidden, vocab, K = 4, 6, 4
+    draft_hidden = torch.randn(1, K, hidden)
+    teacher_logits = torch.randn(1, 7, vocab)
+    out = torch.nn.Linear(hidden, vocab, bias=False)
+    long = lambda v: torch.tensor(v, dtype=torch.long)  # noqa: E731
+    student_t, teacher_t, mask_t, is_rt = student._collect_rejected_draft_log_probs(
+        draft_hidden=draft_hidden,
+        output_embeddings=out,
+        prompt_lengths=long([2]),
+        response_lengths=long([5]),
+        anchor_positions=long([[2]]),
+        block_keep_mask=torch.tensor([[True]]),
+        draft_block_size=K,
+        lm_head_chunk_size=64,
+        max_tokens_per_sample=None,
+        rejected_draft_anchor_indices=long([[0, 0, 0]]),
+        rejected_draft_offsets=long([[1, 2, 3]]),
+        rejected_draft_token_ids=long([[3, 4, 5]]),
+        rejected_draft_teacher_logprobs=None,
+        rejected_draft_mask=torch.tensor([[True, True, True]]),
+        reject_token_mode="off",          # <-- disable the reject-boundary duplicate
+        post_reject_mode="topk_tv",
+        teacher_logits=teacher_logits,
+        topk_fkl_mode="teacher",
+        topk_fkl_teacher_k=2,
+    )
+    assert mask_t.tolist() == [[False, True, True]]  # offset-1 reject token skipped; post-reject slots kept
+    assert not bool(is_rt[0, 0])                      # skipped slot left unflagged/unmasked
+    for col, (draft_slot, trow) in enumerate([(2, 3), (3, 4)], start=1):
+        exp = _manual_topk_tv(
+            draft_hidden, teacher_logits, out, torch.tensor([0]), torch.tensor([draft_slot]), torch.tensor([trow]),
+            "teacher", k=2,
+        )
+        assert torch.allclose(student_t[0, col], exp[0], atol=1e-6)
 
 
 def test_collect_rejected_draft_reverse_token_topk_reverse_kl_postreject():
