@@ -37,16 +37,21 @@ REJECTED_DRAFT_REVERSE=${REJECTED_DRAFT_REVERSE:-True}
 case "${REJECTED_DRAFT_REVERSE,,}" in
     false | 0 | no | off) rejected_draft_stream_weight=0.0 ;;
 esac
+# Independent reject sub-stream weights. rejected_draft_stream_weight = the REVERSE stream (reject-token, the
+# first mismatch d at min offset per anchor); POST_REJECT_STREAM_WEIGHT = the POST-REJECT stream (discarded
+# suffix / deep heads). POST_REJECT_STREAM_WEIGHT<0 (default) inherits the reverse weight -> one shared stream
+# (unchanged). To score each block position ONCE under top-K, drop the reject-token duplicate: keep the reject
+# stream COLLECTED (REJECTED_DRAFT_REVERSE=True) but set REVERSE_STREAM_WEIGHT=0 and POST_REJECT_STREAM_WEIGHT=1.
+rejected_draft_stream_weight=${REVERSE_STREAM_WEIGHT:-${rejected_draft_stream_weight}}
+POST_REJECT_STREAM_WEIGHT=${POST_REJECT_STREAM_WEIGHT:--1.0}
 REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED:-True}
 REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY:-0.8}
-RANDOM_RESPONSE_ANCHOR_ENABLED=${RANDOM_RESPONSE_ANCHOR_ENABLED:-False}
-RANDOM_RESPONSE_ANCHOR_SEED=${RANDOM_RESPONSE_ANCHOR_SEED:-42}
 # draftopd per-region loss selection. The response stream splits into response (accepted tokens) and
 # reject-accept (the corrected token y at SD reject positions); the reject stream splits into reject-token
 # (first mismatch d, min offset per anchor) and post-reject (the discarded suffix). Defaults below reproduce
 # original draftopd (response/reject-accept = Bernoulli forward KL; reject-token/post-reject = reverse KL).
 #   *_LOSS_MODE forward regions: bernoulli_fkl | topk_fkl | topk_tv ; reject regions: reverse_kl | topk_fkl |
-#   topk_reverse_kl (the last needs TOPK_FKL_STUDENT_K>0 so the rejected token d is in the top-K support).
+#   topk_tv | topk_reverse_kl (topk_reverse_kl needs TOPK_FKL_STUDENT_K>0 so the rejected token d is in the top-K).
 #   Top-K forward KL is the in-model FKL over the teacher/student top-K. TOPK_FKL_TEACHER_K and
 #   TOPK_FKL_STUDENT_K: both > 0 -> union; only one > 0 -> that side (teacher-only is the original).
 RESPONSE_LOSS_MODE=${RESPONSE_LOSS_MODE:-bernoulli_fkl}
@@ -64,7 +69,7 @@ TRAIN_JSONL_FILENAME="$(basename "$TRAIN_JSONL")"
 TRAIN_JSONL_NAME="${TRAIN_JSONL_FILENAME%.jsonl}"
 TRAIN_FILES="['$TRAIN_JSONL']"
 TODAY=$(date +"%m-%d")
-EXP_NAME=${EXP_NAME:-"ins-lr-${LR}-random_anchor-${RANDOM_RESPONSE_ANCHOR_ENABLED}/student-teacher-${TODAY}/${DISTILLATION_LOSS_MODE}/enable-thinking-${ENABLE_THINKING}/train-${TRAIN_JSONL_NAME}-update-accumulation-steps"}
+EXP_NAME=${EXP_NAME:-"ins-lr-${LR}/student-teacher-${TODAY}/${DISTILLATION_LOSS_MODE}/enable-thinking-${ENABLE_THINKING}/train-${TRAIN_JSONL_NAME}-update-accumulation-steps"}
 CKPT_DIR=${CKPT_DIR:-"checkpoints/verl-dflash-opd/${EXP_NAME}"}
 
 exec bash "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
@@ -76,8 +81,6 @@ exec bash "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     ++actor_rollout_ref.model.override_config.verl_dflash_draft_model_path="${DRAFT_MODEL_PATH}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_lm_head_chunk_size="${DFLASH_LM_HEAD_CHUNK_SIZE}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_rejected_draft_reverse_enabled="${REJECTED_DRAFT_REVERSE}" \
-    ++actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_enabled="${RANDOM_RESPONSE_ANCHOR_ENABLED}" \
-    ++actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_seed="${RANDOM_RESPONSE_ANCHOR_SEED}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_response_loss_mode="${RESPONSE_LOSS_MODE}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_reject_accept_loss_mode="${REJECT_ACCEPT_LOSS_MODE}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_reject_token_loss_mode="${REJECT_TOKEN_LOSS_MODE}" \
@@ -109,6 +112,7 @@ exec bash "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     distillation.distillation_loss.forward_kl_weight="${FORWARD_KL_WEIGHT}" \
     distillation.distillation_loss.response_stream_weight="${stream_weight}" \
     distillation.distillation_loss.rejected_draft_stream_weight="${rejected_draft_stream_weight}" \
+    distillation.distillation_loss.post_reject_stream_weight="${POST_REJECT_STREAM_WEIGHT}" \
     distillation.distillation_loss.rejected_draft_position_decay_enabled="${REJECTED_DRAFT_POSITION_DECAY_ENABLED}" \
     distillation.distillation_loss.rejected_draft_position_decay="${REJECTED_DRAFT_POSITION_DECAY}" \
     actor_rollout_ref.actor.optim.lr="${LR}" \

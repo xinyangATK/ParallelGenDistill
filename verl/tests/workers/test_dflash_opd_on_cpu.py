@@ -2,11 +2,10 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-from tensordict import TensorDict
+from tensordict import NonTensorData, TensorDict
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager, AgentLoopWorker
 from verl.models.transformers.dflash_student import ComposedDFlashStudentForCausalLM
-from verl.models.transformers.eagle3_student import ComposedEagle3StudentForCausalLM, Eagle3DraftModel
 from verl.protocol import DataProto
 from verl.trainer.distillation.losses import (
     distillation_loss,
@@ -17,7 +16,6 @@ from verl.trainer.ppo.core_algos import kl_penalty
 from verl.utils import tensordict_utils as tu
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 from verl.workers.rollout.sglang_rollout.utils import align_dflash_reject_token_mask
-from transformers import PretrainedConfig
 
 
 def _single_sequence_logprobs(values):
@@ -223,183 +221,6 @@ def test_dflash_anchor_plan_can_stride_response_anchors():
     assert metrics["valid_anchor_count"] == 3
 
 
-def test_random_response_anchor_plan_preserves_count_and_is_seeded():
-    student = object.__new__(ComposedDFlashStudentForCausalLM)
-    input_ids = torch.arange(12, dtype=torch.long).unsqueeze(0)
-    attention_mask = torch.ones_like(input_ids)
-
-    baseline_positions, baseline_segment_lens, _, baseline_keep_mask, _, baseline_metrics = (
-        student._build_opd_anchor_plan(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            prompt_lengths=torch.tensor([2]),
-            response_lengths=torch.tensor([10]),
-            reject_token_indices=torch.tensor([[1, 3, 6]]),
-            draft_block_size=6,
-        )
-    )
-    random_positions_a, random_segment_lens_a, _, random_keep_mask_a, _, random_metrics_a = (
-        student._build_opd_anchor_plan(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            prompt_lengths=torch.tensor([2]),
-            response_lengths=torch.tensor([10]),
-            reject_token_indices=torch.tensor([[1, 3, 6]]),
-            draft_block_size=6,
-            random_response_anchor_enabled=True,
-            random_response_anchor_seed=7,
-        )
-    )
-    random_positions_b, random_segment_lens_b, _, random_keep_mask_b, _, random_metrics_b = (
-        student._build_opd_anchor_plan(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            prompt_lengths=torch.tensor([2]),
-            response_lengths=torch.tensor([10]),
-            reject_token_indices=torch.tensor([[1, 3, 6]]),
-            draft_block_size=6,
-            random_response_anchor_enabled=True,
-            random_response_anchor_seed=7,
-        )
-    )
-
-    assert int(random_keep_mask_a.sum().item()) == int(baseline_keep_mask.sum().item())
-    assert random_metrics_a["valid_anchor_count"] == baseline_metrics["valid_anchor_count"]
-    assert random_metrics_a["total_reject_count"] == baseline_metrics["total_reject_count"]
-    assert torch.equal(random_positions_a, random_positions_b)
-    assert torch.equal(random_segment_lens_a, random_segment_lens_b)
-    assert torch.equal(random_keep_mask_a, random_keep_mask_b)
-    assert random_metrics_a == random_metrics_b
-    baseline_lens = baseline_segment_lens[baseline_keep_mask]
-    random_lens = random_segment_lens_a[random_keep_mask_a]
-    assert int(random_lens.sum().item()) == int(baseline_lens.sum().item())
-    assert torch.equal(torch.sort(random_lens).values, torch.sort(baseline_lens).values)
-    assert int(random_segment_lens_a[random_keep_mask_a].min().item()) > 0
-    assert int(random_segment_lens_a[random_keep_mask_a].max().item()) <= 5
-    covered_response_indices = set()
-    for full_anchor, segment_len in zip(
-        random_positions_a[random_keep_mask_a].tolist(),
-        random_lens.tolist(),
-        strict=False,
-    ):
-        for offset in range(1, segment_len + 1):
-            covered_response_indices.add(full_anchor + offset - 2)
-    assert len(covered_response_indices) == int(random_lens.sum().item())
-
-    found_different_seed = False
-    found_different_from_baseline = not torch.equal(
-        random_positions_a[random_keep_mask_a],
-        baseline_positions[baseline_keep_mask],
-    )
-    for seed in range(8, 32):
-        random_positions_c, _, _, random_keep_mask_c, _, _ = student._build_opd_anchor_plan(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            prompt_lengths=torch.tensor([2]),
-            response_lengths=torch.tensor([10]),
-            reject_token_indices=torch.tensor([[1, 3, 6]]),
-            draft_block_size=6,
-            random_response_anchor_enabled=True,
-            random_response_anchor_seed=seed,
-        )
-        if not torch.equal(
-            random_positions_a[random_keep_mask_a],
-            random_positions_c[random_keep_mask_c],
-        ):
-            found_different_seed = True
-        if not torch.equal(
-            random_positions_c[random_keep_mask_c],
-            baseline_positions[baseline_keep_mask],
-        ):
-            found_different_from_baseline = True
-        if found_different_seed and found_different_from_baseline:
-            break
-    assert found_different_seed
-    assert found_different_from_baseline
-
-
-def test_random_response_anchor_plan_keeps_rejected_draft_zero_length_anchor():
-    student = object.__new__(ComposedDFlashStudentForCausalLM)
-    input_ids = torch.arange(8, dtype=torch.long).unsqueeze(0)
-    attention_mask = torch.ones_like(input_ids)
-
-    anchor_positions, segment_lens, _, block_keep_mask, _, metrics = student._build_opd_anchor_plan(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        prompt_lengths=torch.tensor([2]),
-        response_lengths=torch.tensor([6]),
-        reject_token_indices=torch.tensor([[-1]]),
-        draft_block_size=6,
-        random_response_anchor_enabled=True,
-        random_response_anchor_seed=7,
-        rejected_draft_anchor_indices=torch.tensor([[2]]),
-        rejected_draft_offsets=torch.tensor([[3]]),
-        rejected_draft_mask=torch.tensor([[True]]),
-    )
-
-    assert int(block_keep_mask.sum().item()) == 1
-    assert anchor_positions[0, 0].item() == 4
-    assert segment_lens[0, 0].item() == 0
-    assert metrics["valid_anchor_count"] == 0
-
-
-def test_random_response_anchor_plan_can_skip_rejected_draft_zero_length_anchor():
-    student = object.__new__(ComposedDFlashStudentForCausalLM)
-    input_ids = torch.arange(8, dtype=torch.long).unsqueeze(0)
-    attention_mask = torch.ones_like(input_ids)
-
-    anchor_positions, segment_lens, _, block_keep_mask, _, metrics = student._build_opd_anchor_plan(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        prompt_lengths=torch.tensor([2]),
-        response_lengths=torch.tensor([6]),
-        reject_token_indices=torch.tensor([[-1]]),
-        draft_block_size=6,
-        random_response_anchor_enabled=True,
-        random_response_anchor_seed=7,
-        rejected_draft_anchor_indices=torch.tensor([[2]]),
-        rejected_draft_offsets=torch.tensor([[3]]),
-        rejected_draft_mask=torch.tensor([[True]]),
-        include_rejected_draft_anchors=False,
-    )
-
-    assert not bool(block_keep_mask.any())
-    assert anchor_positions.shape == (1, 1)
-    assert segment_lens.shape == (1, 1)
-    assert metrics["valid_anchor_count"] == 0
-
-
-def test_rejected_draft_anchor_plan_deduplicates_and_respects_token_limit():
-    student = object.__new__(ComposedDFlashStudentForCausalLM)
-    input_ids = torch.arange(12, dtype=torch.long).unsqueeze(0)
-
-    limited_positions, limited_keep_mask = student._build_rejected_draft_anchor_plan(
-        input_ids=input_ids,
-        prompt_lengths=torch.tensor([2]),
-        response_lengths=torch.tensor([10]),
-        draft_block_size=6,
-        max_tokens_per_sample=2,
-        rejected_draft_anchor_indices=torch.tensor([[2, 2, 3]]),
-        rejected_draft_offsets=torch.tensor([[3, 4, 2]]),
-        rejected_draft_token_ids=torch.tensor([[101, 102, 103]]),
-        rejected_draft_mask=torch.tensor([[True, True, True]]),
-    )
-    full_positions, full_keep_mask = student._build_rejected_draft_anchor_plan(
-        input_ids=input_ids,
-        prompt_lengths=torch.tensor([2]),
-        response_lengths=torch.tensor([10]),
-        draft_block_size=6,
-        max_tokens_per_sample=None,
-        rejected_draft_anchor_indices=torch.tensor([[2, 2, 3]]),
-        rejected_draft_offsets=torch.tensor([[3, 4, 2]]),
-        rejected_draft_token_ids=torch.tensor([[101, 102, 103]]),
-        rejected_draft_mask=torch.tensor([[True, True, True]]),
-    )
-
-    assert limited_positions[limited_keep_mask].tolist() == [4]
-    assert full_positions[full_keep_mask].tolist() == [4, 5]
-
-
 def test_rejected_draft_logits_are_selected_from_anchor_and_offset():
     student = object.__new__(ComposedDFlashStudentForCausalLM)
     draft_hidden = torch.zeros(1, 4, 10, dtype=torch.float32)
@@ -516,142 +337,6 @@ def test_selected_lm_log_probs_match_full_logits_path():
     assert torch.allclose(entropy, expected_entropy)
 
 
-def test_eagle3_target_to_draft_mapping_masks_unsupported_tokens():
-    config = PretrainedConfig(
-        hidden_size=4,
-        intermediate_size=8,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=2,
-        hidden_act="silu",
-        rms_norm_eps=1e-6,
-        max_position_embeddings=16,
-        rope_theta=10000,
-        vocab_size=10,
-        draft_vocab_size=3,
-        pad_token_id=0,
-    )
-    draft_model = Eagle3DraftModel(config=config)
-    draft_model.d2t.copy_(torch.tensor([0, 2, 4], dtype=torch.long))
-    draft_model.t2d.zero_()
-    draft_model.t2d[torch.tensor([0, 3, 6])] = True
-    draft_model.refresh_target_to_draft()
-
-    student = object.__new__(ComposedEagle3StudentForCausalLM)
-    student.draft_model = draft_model
-
-    draft_ids, supported = student._map_target_to_draft_ids(torch.tensor([0, 3, 6, 5, 11]))
-
-    assert draft_ids.tolist() == [0, 1, 2, 0, 0]
-    assert supported.tolist() == [True, True, True, False, False]
-
-
-def test_eagle3_native_response_loss_uses_target_distribution_and_masks_unsupported_argmax():
-    class _TinyDraft:
-        def __init__(self):
-            self.t2d = torch.tensor([True, False, True, False, True])
-            self.target_to_draft = torch.tensor([0, -1, 1, -1, 2])
-
-        def compute_logits(self, hidden_states):
-            return hidden_states
-
-    student = object.__new__(ComposedEagle3StudentForCausalLM)
-    student.draft_model = _TinyDraft()
-    draft_hidden = torch.tensor([[[2.0, 1.0, -1.0], [-1.0, 0.0, 1.0]]], dtype=torch.float32)
-    target_logits = torch.tensor(
-        [
-            [
-                [0.0, -5.0, 3.0, -1.0, 1.0],
-                [0.0, 5.0, 1.0, -1.0, 2.0],
-            ]
-        ],
-        dtype=torch.float32,
-    )
-
-    scalar_log_probs, entropy, scalar_supported, native_losses, native_supported, top1_match = (
-        student._compute_eagle3_native_response_outputs(
-            draft_hidden=draft_hidden,
-            target_logits=target_logits,
-            batch_indices=torch.tensor([0, 0], dtype=torch.long),
-            draft_indices=torch.tensor([0, 1], dtype=torch.long),
-            target_row_indices=torch.tensor([0, 1], dtype=torch.long),
-            target_token_ids=torch.tensor([2, 3], dtype=torch.long),
-            chunk_size=1,
-            calculate_entropy=True,
-        )
-    )
-
-    draft_log_probs = torch.log_softmax(draft_hidden[0, 0], dim=-1)
-    target_p = torch.softmax(target_logits[0, 0, [0, 2, 4]], dim=-1)
-    expected_native = -(target_p * draft_log_probs).sum()
-    assert torch.allclose(scalar_log_probs[0], draft_log_probs[1])
-    assert scalar_supported.tolist() == [True, False]
-    assert torch.allclose(native_losses[0], expected_native)
-    assert native_losses[1].item() == 0.0
-    assert native_supported.tolist() == [True, False]
-    assert top1_match.tolist() == [False, False]
-    assert entropy is not None
-    assert entropy[1].item() == 0.0
-
-
-def test_eagle3_rejected_forced_inputs_use_previous_rejected_token():
-    student = object.__new__(ComposedEagle3StudentForCausalLM)
-    input_ids = torch.tensor([[10, 11, 12, 13, 14, 15]], dtype=torch.long)
-    forced = student._build_rejected_forced_input_token_ids(
-        input_ids=input_ids,
-        prompt_lengths=torch.tensor([2]),
-        response_lengths=torch.tensor([4]),
-        anchor_positions=torch.tensor([[3]]),
-        block_keep_mask=torch.tensor([[True]]),
-        draft_block_size=4,
-        max_tokens_per_sample=None,
-        rejected_draft_anchor_indices=torch.tensor([[1, 1]]),
-        rejected_draft_offsets=torch.tensor([[1, 2]]),
-        rejected_draft_token_ids=torch.tensor([[101, 102]]),
-        rejected_draft_mask=torch.tensor([[True, True]]),
-    )
-
-    assert forced.tolist() == [[[-1, -1, 101, 102]]]
-
-
-def test_eagle3_native_distillation_loss_uses_precomputed_ce_and_logs_scalar_k3():
-    data = TensorDict(
-        {
-            "prompts": torch.tensor([[1]], dtype=torch.long),
-            "responses": torch.tensor([[2, 3]], dtype=torch.long),
-            "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
-            "response_mask": torch.tensor([[1, 1]], dtype=torch.long),
-            "teacher_logprobs": _single_sequence_logprobs([-0.5, -0.7, 0.0]),
-        },
-        batch_size=[1],
-    )
-    model_output = {
-        "log_probs": torch.tensor([-0.4, -0.9, 0.0], dtype=torch.float32),
-        "opd_loss_mask": torch.tensor([1.0, 1.0, 0.0], dtype=torch.float32),
-        "eagle3_native_ce_losses": torch.tensor([1.25, 0.75, 0.0], dtype=torch.float32),
-        "eagle3_selected_scalar_loss_mask": torch.tensor([1.0, 1.0, 0.0], dtype=torch.float32),
-    }
-    config = SimpleNamespace(loss_agg_mode="token-mean", global_batch_info={})
-    loss_config = SimpleNamespace(
-        loss_mode="eagle3_native_target_distribution",
-        loss_max_clamp=None,
-        use_policy_gradient=False,
-        response_stream_weight=1.0,
-        rejected_draft_stream_weight=0.0,
-    )
-    distillation_config = SimpleNamespace(distillation_loss=loss_config)
-
-    loss, metrics = distillation_loss(config, distillation_config, model_output, data)
-
-    expected_scalar_k3 = kl_penalty(torch.tensor([-0.4, -0.9]), torch.tensor([-0.5, -0.7]), "k3").mean()
-    assert torch.allclose(loss, torch.tensor(1.0))
-    assert metrics["eagle3/native_ce_loss"].values == [1.0]
-    assert torch.allclose(
-        torch.as_tensor(metrics["eagle3/selected_scalar_k3_loss"].values[0]),
-        expected_scalar_k3,
-    )
-
-
 def test_rejected_draft_stream_accepts_nested_postprocess_output():
     student = torch.nested.as_nested_tensor(
         [torch.tensor([-1.1, -0.8]), torch.tensor([0.0])], layout=torch.jagged
@@ -740,96 +425,6 @@ def test_combined_k3_loss_includes_rejected_draft_tokens():
     assert metrics["distillation/rejected_draft_token_count"].values == [2.0]
 
 
-def test_forward_kl_weight_uses_local_forward_kl_for_response_and_rejected_draft_tokens():
-    data = TensorDict(
-        {
-            "prompts": torch.tensor([[1]], dtype=torch.long),
-            "responses": torch.tensor([[2, 3]], dtype=torch.long),
-            "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
-            "response_mask": torch.tensor([[1, 1]], dtype=torch.long),
-            "teacher_logprobs": _single_sequence_logprobs([-0.5, -0.7, 0.0]),
-        },
-        batch_size=[1],
-    )
-    model_output = {
-        "log_probs": torch.tensor([-0.4, -0.9, 0.0], dtype=torch.float32),
-        "opd_loss_mask": torch.tensor([1.0, 1.0, 0.0], dtype=torch.float32),
-        "opd_rejected_draft_student_log_probs": torch.tensor([[-1.1, -0.8]], dtype=torch.float32),
-        "opd_rejected_draft_teacher_log_probs": torch.tensor([[-0.6, -1.2]], dtype=torch.float32),
-        "opd_rejected_draft_loss_mask": torch.tensor([[True, True]]),
-    }
-    config = SimpleNamespace(loss_agg_mode="token-mean", global_batch_info={})
-    loss_config = SimpleNamespace(
-        loss_mode="k3",
-        loss_max_clamp=None,
-        use_policy_gradient=False,
-        reverse_kl_weight=0.0,
-        forward_kl_weight=1.0,
-        response_stream_weight=1.0,
-        rejected_draft_stream_weight=1.0,
-    )
-    distillation_config = SimpleNamespace(distillation_loss=loss_config)
-
-    loss, metrics = distillation_loss(config, distillation_config, model_output, data)
-
-    response_losses = _local_forward_kl(torch.tensor([-0.4, -0.9]), torch.tensor([-0.5, -0.7]))
-    rejected_losses = _local_forward_kl(torch.tensor([-1.1, -0.8]), torch.tensor([-0.6, -1.2]))
-    assert torch.allclose(loss, torch.cat([response_losses, rejected_losses]).mean())
-    assert torch.allclose(
-        torch.as_tensor(metrics["distillation/forward_kl_loss"].values[0]),
-        response_losses.mean(),
-    )
-    assert torch.allclose(
-        torch.as_tensor(metrics["distillation/rejected_draft_forward_kl_loss"].values[0]),
-        rejected_losses.mean(),
-    )
-
-
-def test_reverse_and_forward_kl_weights_are_combined_before_token_mean():
-    data = TensorDict(
-        {
-            "prompts": torch.tensor([[1]], dtype=torch.long),
-            "responses": torch.tensor([[2, 3]], dtype=torch.long),
-            "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
-            "response_mask": torch.tensor([[1, 1]], dtype=torch.long),
-            "teacher_logprobs": _single_sequence_logprobs([-0.5, -0.7, 0.0]),
-        },
-        batch_size=[1],
-    )
-    model_output = {
-        "log_probs": torch.tensor([-0.4, -0.9, 0.0], dtype=torch.float32),
-        "opd_loss_mask": torch.tensor([1.0, 1.0, 0.0], dtype=torch.float32),
-        "opd_rejected_draft_student_log_probs": torch.tensor([[-1.1, -0.8]], dtype=torch.float32),
-        "opd_rejected_draft_teacher_log_probs": torch.tensor([[-0.6, -1.2]], dtype=torch.float32),
-        "opd_rejected_draft_loss_mask": torch.tensor([[True, True]]),
-    }
-    config = SimpleNamespace(loss_agg_mode="token-mean", global_batch_info={})
-    loss_config = SimpleNamespace(
-        loss_mode="k3",
-        loss_max_clamp=None,
-        use_policy_gradient=False,
-        reverse_kl_weight=0.25,
-        forward_kl_weight=0.75,
-        response_stream_weight=1.0,
-        rejected_draft_stream_weight=1.0,
-    )
-    distillation_config = SimpleNamespace(distillation_loss=loss_config)
-
-    loss, _ = distillation_loss(config, distillation_config, model_output, data)
-
-    response_student = torch.tensor([-0.4, -0.9])
-    response_teacher = torch.tensor([-0.5, -0.7])
-    rejected_student = torch.tensor([-1.1, -0.8])
-    rejected_teacher = torch.tensor([-0.6, -1.2])
-    response_losses = 0.25 * kl_penalty(response_student, response_teacher, "k3") + 0.75 * _local_forward_kl(
-        response_student, response_teacher
-    )
-    rejected_losses = 0.25 * kl_penalty(rejected_student, rejected_teacher, "k3") + 0.75 * _local_forward_kl(
-        rejected_student, rejected_teacher
-    )
-    assert torch.allclose(loss, torch.cat([response_losses, rejected_losses]).mean())
-
-
 def test_rejected_draft_can_use_reverse_kl_while_response_uses_forward_kl():
     data = TensorDict(
         {
@@ -881,7 +476,7 @@ def test_rejected_draft_can_use_reverse_kl_while_response_uses_forward_kl():
         response_losses.mean(),
     )
     assert torch.allclose(
-        torch.as_tensor(metrics["distillation/rejected_draft_reverse_kl_loss"].values[0]),
+        torch.as_tensor(metrics["distillation/rejected_draft_loss"].values[0]),
         rejected_losses.mean(),
     )
     assert "distillation/rejected_draft_forward_kl_loss" not in metrics
@@ -1100,3 +695,73 @@ def test_count_dflash_rejected_draft_tokens_respects_empty_values_and_limit():
         )
         == 0
     )
+
+
+def _bernoulli_forward_kl(student, teacher):
+    student = torch.as_tensor(student, dtype=torch.float32)
+    teacher = torch.as_tensor(teacher, dtype=torch.float32)
+    sp, tp = student.exp(), teacher.exp()
+    return tp * (teacher - student) + (1.0 - tp) * (torch.log1p(-tp) - torch.log1p(-sp))
+
+
+def _response_stream_case(reject_indices):
+    # 1 prompt token + 3 response tokens; reject at the given response positions.
+    data = TensorDict(
+        {
+            "prompts": torch.tensor([[1]], dtype=torch.long),
+            "responses": torch.tensor([[2, 3, 4]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+            "teacher_logprobs": _single_sequence_logprobs([-0.5, -0.7, -0.6, 0.0]),
+        },
+        batch_size=[1],
+    )
+    data.set("dflash_reject_token_indices", NonTensorData([reject_indices]))
+    model_output = {
+        "log_probs": torch.tensor([-0.4, -0.9, -0.3, 0.0], dtype=torch.float32),
+        "opd_loss_mask": torch.tensor([1.0, 1.0, 1.0, 0.0], dtype=torch.float32),
+    }
+    return data, model_output
+
+
+def _symmetric_k3_cfg():
+    return SimpleNamespace(
+        loss_mode="k3",
+        loss_max_clamp=None,
+        log_prob_min_clamp=None,
+        use_policy_gradient=False,
+        reverse_kl_weight=0.5,
+        forward_kl_weight=1.0,
+        response_stream_weight=1.0,
+        rejected_draft_stream_weight=1.0,
+    )
+
+
+def test_corrected_token_is_forward_only_by_default():
+    # By default (no flag), the corrected token at a reject position drops its reverse-KL term;
+    # agree positions stay symmetric. reject at response position 1.
+    data, model_output = _response_stream_case(reject_indices=[1])
+    config = SimpleNamespace(loss_agg_mode="token-mean", global_batch_info={})
+
+    loss, _ = distillation_loss(config, SimpleNamespace(distillation_loss=_symmetric_k3_cfg()), model_output, data)
+
+    student = torch.tensor([-0.4, -0.9, -0.3])
+    teacher = torch.tensor([-0.5, -0.7, -0.6])
+    k3 = kl_penalty(student, teacher, "k3")
+    bern = _bernoulli_forward_kl(student, teacher)
+    reverse_on = torch.tensor([1.0, 0.0, 1.0])  # reverse dropped at the corrected (reject) position
+    per_token = 0.5 * k3 * reverse_on + 1.0 * bern
+    assert torch.allclose(loss, per_token.mean())
+
+
+def test_no_reject_means_pure_symmetric_kl():
+    # No reject positions -> every response token keeps the full symmetric KL.
+    data, model_output = _response_stream_case(reject_indices=[])
+    config = SimpleNamespace(loss_agg_mode="token-mean", global_batch_info={})
+
+    loss, _ = distillation_loss(config, SimpleNamespace(distillation_loss=_symmetric_k3_cfg()), model_output, data)
+
+    student = torch.tensor([-0.4, -0.9, -0.3])
+    teacher = torch.tensor([-0.5, -0.7, -0.6])
+    per_token = 0.5 * kl_penalty(student, teacher, "k3") + 1.0 * _bernoulli_forward_kl(student, teacher)
+    assert torch.allclose(loss, per_token.mean())

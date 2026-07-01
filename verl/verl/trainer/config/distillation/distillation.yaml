@@ -42,8 +42,12 @@ distillation_loss:
   # Token weight for the standard response-token OPD stream.
   response_stream_weight: 1.0
 
-  # Token weight for DFLASH rejected draft suffix tokens.
+  # Token weight for the reverse stream (reject-token, the first mismatch d at min offset per anchor).
   rejected_draft_stream_weight: 1.0
+
+  # Token weight for the post-reject (discarded-suffix) stream. <0 (default) inherits rejected_draft_stream_weight
+  # so reverse + post-reject share one weight; set >=0 to weight the post-reject slots independently.
+  post_reject_stream_weight: -1.0
 
   # Whether to decay rejected draft token weights by their position in a draft block.
   rejected_draft_position_decay_enabled: true
@@ -51,13 +55,10 @@ distillation_loss:
   # Per-position decay for rejected draft tokens: offset 1 -> 1.0, offset 2 -> decay, offset 3 -> decay^2.
   rejected_draft_position_decay: 0.9
 
-  # paradistill: the reverse stream is fresh on-policy draft samples co-located with
-  # the response stream (paired with the model override verl_dflash_onpolicy_reverse_enabled).
-  onpolicy_reverse_enabled: false
-
   # draftopd per-region loss selection (paired with the verl_dflash_*_loss_mode model overrides).
-  # Forward regions: bernoulli_fkl | topk_fkl. Reject regions: reverse_kl | topk_fkl. Top-K is the in-model
-  # forward KL over teacher/student top-K (both K > 0 -> union). Defaults reproduce original draftopd.
+  # Forward regions: bernoulli_fkl | topk_fkl | topk_tv. Reject regions: reverse_kl | topk_fkl | topk_tv |
+  # topk_reverse_kl. Top-K losses (forward KL / total-variation / reverse KL) are in-model over teacher/student
+  # top-K (both K > 0 -> union). Defaults reproduce original draftopd.
   response_loss_mode: bernoulli_fkl
   reject_accept_loss_mode: bernoulli_fkl
   reject_token_loss_mode: reverse_kl

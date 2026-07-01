@@ -47,7 +47,13 @@ class DistillationLossConfig(BaseConfig):
     response_stream_weight (float):
         Token weight for the standard response-token OPD stream.
     rejected_draft_stream_weight (float):
-        Token weight for DFLASH rejected draft suffix tokens.
+        Token weight for the REVERSE stream (reject-token, the first-mismatch d at min offset per anchor).
+    post_reject_stream_weight (float):
+        Token weight for the POST-REJECT stream (discarded-suffix / deep-head slots), independent of the
+        reverse stream. SENTINEL: <0 (default) inherits rejected_draft_stream_weight so reverse + post-reject
+        share ONE weighted stream (byte-identical to the pre-split combine). Set >=0 to weight the post-reject
+        stream independently, e.g. rejected_draft_stream_weight=0 + post_reject_stream_weight=1 trains ONLY the
+        post-reject slots (drops the reject-token duplicate that reject_accept already covers under top-K).
     rejected_draft_position_decay_enabled (bool):
         Whether to decay rejected draft token loss weights by draft offset.
     rejected_draft_position_decay (float):
@@ -83,17 +89,14 @@ class DistillationLossConfig(BaseConfig):
     forward_kl_weight: float = 0.0
     response_stream_weight: float = 1.0
     rejected_draft_stream_weight: float = 1.0
+    post_reject_stream_weight: float = -1.0
     rejected_draft_position_decay_enabled: bool = True
     rejected_draft_position_decay: float = 0.9
-    # paradistill: the reverse stream is fresh on-policy draft samples co-located with the
-    # response stream (N_rejected == N_response), so it shares the response normalization basis instead of
-    # the engine's rollout-reject count. Paired with verl_dflash_onpolicy_reverse_enabled on the model.
-    onpolicy_reverse_enabled: bool = False
     # draftopd per-region loss selection. The response stream splits into the response (accepted) and
     # reject-accept (corrected token y at SD reject positions) regions; the reject stream splits into the
     # reject-token (first mismatch d, min offset per anchor) and post-reject (discarded suffix) regions.
     # Forward regions choose bernoulli_fkl | topk_fkl | topk_tv; reject regions choose reverse_kl | topk_fkl |
-    # topk_reverse_kl. Top-K losses (forward KL / total-variation / reverse KL) are computed in-model over the
+    # topk_tv | topk_reverse_kl. Top-K losses (forward KL / total-variation / reverse KL) are computed in-model over the
     # teacher/student top-K (both K > 0 -> union); at a reject position the top-K support holds both the
     # corrected token y and the rejected token d, so topk_reverse_kl trains both without separating them.
     # SEMANTIC OVERLOAD: the top-K value rides in existing channels (response: model_output["log_probs"];

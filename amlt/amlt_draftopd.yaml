@@ -81,6 +81,13 @@ env_defaults:
   TOPK_FKL_TEACHER_K: 16        # teacher-side top-K (0 disables the teacher support)
   TOPK_FKL_STUDENT_K: 16         # student-side top-K (0 disables; both > 0 -> union). REQUIRED > 0 for topk_reverse_kl.
   RESPONSE_STREAM_WEIGHT: 1.0   # response-stream weight; set 0 to train ONLY reject positions
+  # Reject side = two INDEPENDENT streams. REVERSE_STREAM_WEIGHT weights the reverse (reject-token, first
+  # mismatch d) stream; POST_REJECT_STREAM_WEIGHT weights the post-reject (discarded suffix / deep-head) stream.
+  # POST_REJECT_STREAM_WEIGHT=-1 (default) inherits the reverse weight -> one shared stream (original behavior).
+  # Score each block position ONCE under top-K: REVERSE_STREAM_WEIGHT=0 + POST_REJECT_STREAM_WEIGHT=1 (keep
+  # REJECTED_DRAFT_REVERSE=True so the reject stream is still collected).
+  REVERSE_STREAM_WEIGHT: 1.0
+  POST_REJECT_STREAM_WEIGHT: -1.0
   # Reject-stream per-offset weighting: weight each rejected/FKL slot by DECAY^(offset-1) (offset = draft
   # head depth). Applies to BOTH the baseline reverse stream and the Request 2 top-K FKL. ENABLED=False ->
   # uniform weights. Matches the launcher defaults (True / 0.8); set here to make them tunable at submit.
@@ -162,6 +169,8 @@ jobs:
       - export TOPK_FKL_TEACHER_K=${TOPK_FKL_TEACHER_K}
       - export TOPK_FKL_STUDENT_K=${TOPK_FKL_STUDENT_K}
       - export stream_weight=${RESPONSE_STREAM_WEIGHT}
+      - export REVERSE_STREAM_WEIGHT=${REVERSE_STREAM_WEIGHT}
+      - export POST_REJECT_STREAM_WEIGHT=${POST_REJECT_STREAM_WEIGHT}
       - export REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED}
       - export REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY}
       - export train_epochs=${train_epochs}

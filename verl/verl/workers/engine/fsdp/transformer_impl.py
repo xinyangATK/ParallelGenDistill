@@ -1573,7 +1573,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 dflash_log_probs = output.get("dflash_log_probs")
                 dflash_entropy = output.get("dflash_entropy")
                 dflash_loss_mask = output.get("dflash_loss_mask")
-                dflash_response_offsets = output.get("dflash_response_offsets")
                 dflash_rejected_draft_student_log_probs = output.get("dflash_rejected_draft_student_log_probs")
                 dflash_rejected_draft_teacher_log_probs = output.get("dflash_rejected_draft_teacher_log_probs")
                 dflash_rejected_draft_loss_mask = output.get("dflash_rejected_draft_loss_mask")
@@ -1585,7 +1584,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 dflash_log_probs = getattr(output, "dflash_log_probs", None)
                 dflash_entropy = getattr(output, "dflash_entropy", None)
                 dflash_loss_mask = getattr(output, "dflash_loss_mask", None)
-                dflash_response_offsets = getattr(output, "dflash_response_offsets", None)
                 dflash_rejected_draft_student_log_probs = getattr(
                     output, "dflash_rejected_draft_student_log_probs", None
                 )
@@ -1624,8 +1622,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "log_probs": format_dflash_sequence_output(dflash_log_probs),
                 "opd_loss_mask": format_dflash_sequence_output(dflash_loss_mask),
             }
-            if dflash_response_offsets is not None:
-                model_output["opd_response_offsets"] = format_dflash_sequence_output(dflash_response_offsets)
             if eagle3_native_ce_losses is not None:
                 model_output["eagle3_native_ce_losses"] = format_dflash_sequence_output(eagle3_native_ce_losses)
             if eagle3_selected_scalar_loss_mask is not None:

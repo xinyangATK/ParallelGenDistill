@@ -95,10 +95,6 @@ DFLASH_ATTENTION_IMPL="flex_attention"
 DFLASH_LM_HEAD_CHUNK_SIZE=512
 DFLASH_RESPONSE_ANCHOR_STRIDE=1 # 控制 response 里用于构造 DFLASH anchor/segment 的密度, 1代表全部计算，2代表隔一个计算一个
 
-# 用来做随机anchor的消融
-RANDOM_RESPONSE_ANCHOR_ENABLED=${RANDOM_RESPONSE_ANCHOR_ENABLED:-False}
-RANDOM_RESPONSE_ANCHOR_SEED=${RANDOM_RESPONSE_ANCHOR_SEED:-42}
-
 LR=1e-5
 SEED=42
 STUDENT_WORLD_SIZE=6
@@ -152,8 +148,6 @@ MODEL=(
     +actor_rollout_ref.model.override_config.verl_dflash_attention_impl="$DFLASH_ATTENTION_IMPL"
     +actor_rollout_ref.model.override_config.verl_dflash_lm_head_chunk_size=$DFLASH_LM_HEAD_CHUNK_SIZE
     +actor_rollout_ref.model.override_config.verl_dflash_response_anchor_stride=$DFLASH_RESPONSE_ANCHOR_STRIDE
-    +actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_enabled=$RANDOM_RESPONSE_ANCHOR_ENABLED
-    +actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_seed=$RANDOM_RESPONSE_ANCHOR_SEED
     actor_rollout_ref.model.enable_gradient_checkpointing=False
     actor_rollout_ref.model.use_remove_padding=True
     actor_rollout_ref.model.use_fused_kernels=$USE_FUSED_KERNELS

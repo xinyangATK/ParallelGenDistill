@@ -557,41 +557,6 @@ def _build_rejected_draft_position_weights(
     return weights * rejected_draft_mask.to(dtype=torch.float32), True
 
 
-def _build_response_position_weights(
-    *,
-    model_output: dict,
-    data: TensorDict,
-    effective_response_mask: torch.Tensor,
-    loss_config: DistillationLossConfig,
-) -> tuple[torch.Tensor, bool]:
-    """Per-response-token decay weights ``decay^(offset-1)`` (offset = draft head depth) for paradistill.
-
-    Mirrors ``_build_rejected_draft_position_weights`` but for the RESPONSE (forward) stream, so both
-    streams share the same per-offset decay. Returns ``(weights, applied)``; ``weights`` is the plain
-    ``effective_response_mask`` (and ``applied=False``) unless on-policy reverse is on, decay is enabled,
-    and the model emitted ``opd_response_offsets`` -- so draftopd / non-decay paths are byte-identical.
-    """
-    if not bool(getattr(loss_config, "onpolicy_reverse_enabled", False)):
-        return effective_response_mask.to(dtype=torch.float32), False
-    if not bool(getattr(loss_config, "rejected_draft_position_decay_enabled", True)):
-        return effective_response_mask.to(dtype=torch.float32), False
-    offsets_raw = model_output.get("opd_response_offsets")
-    if offsets_raw is None:
-        return effective_response_mask.to(dtype=torch.float32), False
-    decay = float(getattr(loss_config, "rejected_draft_position_decay", 0.9))
-    if decay <= 0.0 or decay > 1.0:
-        raise ValueError(f"rejected_draft_position_decay must be in (0, 1], got {decay}.")
-    offsets = no_padding_2_padding(offsets_raw, data).to(device=effective_response_mask.device)
-    if offsets.shape != effective_response_mask.shape:
-        raise RuntimeError(
-            "Response decay offsets must match the response mask shape, got "
-            f"offsets={tuple(offsets.shape)}, mask={tuple(effective_response_mask.shape)}."
-        )
-    exponents = (offsets.to(dtype=torch.float32) - 1.0).clamp_min(0.0)
-    weights = torch.pow(offsets.new_tensor(decay, dtype=torch.float32), exponents)
-    return weights * effective_response_mask.to(dtype=torch.float32), True
-
-
 def _agg_loss_global_batch_info(config: ActorConfig) -> dict[str, Any]:
     global_batch_info = getattr(config, "global_batch_info", {}) or {}
     return {key: value for key, value in global_batch_info.items() if key in _AGG_LOSS_GLOBAL_BATCH_INFO_KEYS}
@@ -678,14 +643,10 @@ def distillation_loss(
             rejected_draft_mask=rejected_draft_mask,
             loss_config=loss_config,
         )
-        # Reject-stream loss selection is INDEPENDENT of the reverse-token source. The student/teacher
-        # channels carry (log q, log p) for either the rollout-cached rejected token d (draftopd,
-        # onpolicy_reverse_enabled=False) OR a fresh on-policy sample y_hat ~ q drawn in the model
-        # (paradistill, onpolicy_reverse_enabled=True). Both select the loss by region via
+        # Reject-stream loss selection. The student/teacher channels carry (log q, log p) for the
+        # rollout-cached rejected token d (draftopd). Both reject regions select the loss by region via
         # reject_token_loss_mode / post_reject_loss_mode: reverse_kl -> k3 on (log q, log p), or an in-model
-        # top-K loss precomputed in the student channel (topk_fkl / topk_tv / topk_reverse_kl). paradistill is a single
-        # reverse region: top-K is excluded for it (model raises), so both reject regions are reverse_kl and
-        # fall into the both-reverse branch below -> a uniform k3 over the fresh samples. Decay applies below.
+        # top-K loss precomputed in the student channel (topk_fkl / topk_tv / topk_reverse_kl).
         reject_direct_modes = ("topk_fkl", "topk_tv", "topk_reverse_kl")
         reject_token_direct = str(getattr(loss_config, "reject_token_loss_mode", "reverse_kl")) in reject_direct_modes
         post_reject_direct = str(getattr(loss_config, "post_reject_loss_mode", "reverse_kl")) in reject_direct_modes
@@ -773,59 +734,77 @@ def distillation_loss(
         else:
             response_weight = float(getattr(loss_config, "response_stream_weight", 1.0))
             rejected_weight = float(getattr(loss_config, "rejected_draft_stream_weight", 1.0))
+            # Post-reject stream weight. <0 sentinel -> inherit the reverse weight (reverse + post-reject stay
+            # ONE stream, byte-identical to the pre-split combine). >=0 and != reverse weight -> split into two
+            # independent streams (reverse = reject-token, post-reject = discarded suffix).
+            post_reject_weight_cfg = float(getattr(loss_config, "post_reject_stream_weight", -1.0))
+            pr_weight = post_reject_weight_cfg if post_reject_weight_cfg >= 0.0 else rejected_weight
+            split_reject = post_reject_weight_cfg >= 0.0 and post_reject_weight_cfg != rejected_weight
             global_batch_info = getattr(config, "global_batch_info", {}) or {}
-            # Response stream per-offset decay (paradistill): weight each response token by decay^(offset-1),
-            # same factor as the reverse stream. No-op (plain mask) for draftopd / decay-off -> unchanged.
-            response_weights, response_decay_applied = _build_response_position_weights(
-                model_output=model_output,
-                data=data,
-                effective_response_mask=effective_response_mask,
-                loss_config=loss_config,
-            )
+            response_weights = effective_response_mask.to(dtype=torch.float32)
             response_count = effective_response_mask.sum().to(dtype=distillation_losses.dtype)
-            response_effective_count = response_weights.sum().to(dtype=distillation_losses.dtype)
             rejected_count = rejected_draft_mask.sum().to(dtype=distillation_losses.dtype)
             rejected_effective_count = rejected_loss_weights.sum().to(dtype=distillation_losses.dtype)
             response_sum = (distillation_losses * response_weights.to(dtype=distillation_losses.dtype)).sum()
             rejected_sum = (rejected_draft_losses * rejected_loss_weights.to(dtype=rejected_draft_losses.dtype)).sum()
             global_response_count = global_batch_info.get("batch_num_tokens")
-            if response_decay_applied:
-                # decay-weighted numerator -> the denominator must use the (global) decay-weight sum, not the
-                # plain token count (mirrors the reverse stream's effective-count handling).
-                global_response_count = _global_sum(response_effective_count, dp_group)
-            elif global_response_count is None:
+            if global_response_count is None:
                 global_response_count = response_count
-            global_rejected_count = global_batch_info.get("opd_rejected_draft_batch_num_tokens")
-            global_rejected_effective_count = global_batch_info.get(
-                "opd_rejected_draft_batch_effective_num_tokens"
-            )
             reject_is_topk = (
                 str(getattr(loss_config, "reject_token_loss_mode", "reverse_kl")) in ("topk_fkl", "topk_tv", "topk_reverse_kl")
                 or str(getattr(loss_config, "post_reject_loss_mode", "reverse_kl")) in ("topk_fkl", "topk_tv", "topk_reverse_kl")
             )
-            if loss_config.onpolicy_reverse_enabled or reject_is_topk:
-                # paradistill / draftopd reject top-K FKL build their own (block, offset) slots (and top-K
-                # drops OOB suffix slots) that do not match the engine's rollout-reject counts, so all-reduce
-                # the actual local slot count and the local decay-weight sum instead (no-op on CPU / 1 rank).
-                global_rejected_count = _global_sum(rejected_count, dp_group)
-                global_rejected_effective_count = _global_sum(rejected_effective_count, dp_group)
-            else:
-                if global_rejected_count is None:
-                    global_rejected_count = rejected_count
-                if global_rejected_effective_count is None:
-                    global_rejected_effective_count = (
-                        _global_sum(rejected_effective_count, dp_group)
-                        if rejected_position_decay_applied
-                        else _scalar_like(global_rejected_count, rejected_effective_count)
+            if split_reject:
+                # ---- Two independent reject streams: reverse (reject-token, min offset per anchor) and
+                #      post-reject (discarded suffix). Split the per-slot losses / decay weights by the
+                #      reject-token tag; each sub-stream gets its own weight. Always all-reduce the LOCAL
+                #      decay-weight sums (the engine's rollout-reject counts don't split; no-op on CPU / 1 rank).
+                is_rt = model_output.get("opd_rejected_draft_is_reject_token")
+                if is_rt is None:
+                    raise RuntimeError(
+                        "post_reject_stream_weight split requires opd_rejected_draft_is_reject_token from the model."
                     )
-            denom = (
-                response_weight * _scalar_like(global_response_count, response_count)
-                + rejected_weight * _scalar_like(global_rejected_effective_count, rejected_effective_count)
-            )
+                is_rt = _flatten_nested_tensor(is_rt).to(device=rejected_draft_mask.device).bool()
+                reverse_w = (rejected_loss_weights * is_rt.to(rejected_loss_weights.dtype)).to(dtype=distillation_losses.dtype)
+                postreject_w = (rejected_loss_weights * (~is_rt).to(rejected_loss_weights.dtype)).to(dtype=distillation_losses.dtype)
+                reverse_sum = (rejected_draft_losses.to(dtype=distillation_losses.dtype) * reverse_w).sum()
+                postreject_sum = (rejected_draft_losses.to(dtype=distillation_losses.dtype) * postreject_w).sum()
+                reverse_effective_count = reverse_w.sum()
+                postreject_effective_count = postreject_w.sum()
+                global_reverse_effective = _global_sum(reverse_effective_count, dp_group)
+                global_postreject_effective = _global_sum(postreject_effective_count, dp_group)
+                reject_numerator = rejected_weight * reverse_sum + pr_weight * postreject_sum
+                reject_denom = (
+                    rejected_weight * _scalar_like(global_reverse_effective, reverse_effective_count)
+                    + pr_weight * _scalar_like(global_postreject_effective, postreject_effective_count)
+                )
+            else:
+                global_rejected_count = global_batch_info.get("opd_rejected_draft_batch_num_tokens")
+                global_rejected_effective_count = global_batch_info.get(
+                    "opd_rejected_draft_batch_effective_num_tokens"
+                )
+                if reject_is_topk:
+                    # draftopd reject top-K FKL builds its own (block, offset) slots (and top-K
+                    # drops OOB suffix slots) that do not match the engine's rollout-reject counts, so all-reduce
+                    # the actual local slot count and the local decay-weight sum instead (no-op on CPU / 1 rank).
+                    global_rejected_count = _global_sum(rejected_count, dp_group)
+                    global_rejected_effective_count = _global_sum(rejected_effective_count, dp_group)
+                else:
+                    if global_rejected_count is None:
+                        global_rejected_count = rejected_count
+                    if global_rejected_effective_count is None:
+                        global_rejected_effective_count = (
+                            _global_sum(rejected_effective_count, dp_group)
+                            if rejected_position_decay_applied
+                            else _scalar_like(global_rejected_count, rejected_effective_count)
+                        )
+                reject_numerator = rejected_weight * rejected_sum
+                reject_denom = rejected_weight * _scalar_like(global_rejected_effective_count, rejected_effective_count)
+            denom = response_weight * _scalar_like(global_response_count, response_count) + reject_denom
             if denom.item() <= 0:
                 distillation_loss = (response_sum + rejected_sum) * 0.0
             else:
-                distillation_loss = (response_weight * response_sum + rejected_weight * rejected_sum) / denom
+                distillation_loss = (response_weight * response_sum + reject_numerator) / denom
                 distillation_loss = distillation_loss * _scalar_like(
                     global_batch_info.get("dp_size", 1), distillation_loss
                 )

@@ -390,48 +390,6 @@ def test_collect_rejected_draft_is_reject_token_min_offset_and_mixed_regions():
         assert teacher_t[0, col] == 0.0
 
 
-def test_collect_rejected_draft_reject_token_off_skips_boundary_keeps_postreject():
-    # reject_token_loss_mode=off drops the reject-BOUNDARY slot (min offset) entirely -- reject_accept already
-    # covers it in the response stream -- while post_reject=topk_tv keeps the discarded-suffix (deep) heads.
-    # One anchor (full pos 2), K=4, offsets 1(=reject token),2,3; valid_len=2+5=7 so targets 3,4,5 in bounds.
-    student = object.__new__(ComposedDFlashStudentForCausalLM)
-    torch.manual_seed(2)
-    hidden, vocab, K = 4, 6, 4
-    draft_hidden = torch.randn(1, K, hidden)
-    teacher_logits = torch.randn(1, 7, vocab)
-    out = torch.nn.Linear(hidden, vocab, bias=False)
-    long = lambda v: torch.tensor(v, dtype=torch.long)  # noqa: E731
-    student_t, teacher_t, mask_t, is_rt = student._collect_rejected_draft_log_probs(
-        draft_hidden=draft_hidden,
-        output_embeddings=out,
-        prompt_lengths=long([2]),
-        response_lengths=long([5]),
-        anchor_positions=long([[2]]),
-        block_keep_mask=torch.tensor([[True]]),
-        draft_block_size=K,
-        lm_head_chunk_size=64,
-        max_tokens_per_sample=None,
-        rejected_draft_anchor_indices=long([[0, 0, 0]]),
-        rejected_draft_offsets=long([[1, 2, 3]]),
-        rejected_draft_token_ids=long([[3, 4, 5]]),
-        rejected_draft_teacher_logprobs=None,
-        rejected_draft_mask=torch.tensor([[True, True, True]]),
-        reject_token_mode="off",          # <-- disable the reject-boundary duplicate
-        post_reject_mode="topk_tv",
-        teacher_logits=teacher_logits,
-        topk_fkl_mode="teacher",
-        topk_fkl_teacher_k=2,
-    )
-    assert mask_t.tolist() == [[False, True, True]]  # offset-1 reject token skipped; post-reject slots kept
-    assert not bool(is_rt[0, 0])                      # skipped slot left unflagged/unmasked
-    for col, (draft_slot, trow) in enumerate([(2, 3), (3, 4)], start=1):
-        exp = _manual_topk_tv(
-            draft_hidden, teacher_logits, out, torch.tensor([0]), torch.tensor([draft_slot]), torch.tensor([trow]),
-            "teacher", k=2,
-        )
-        assert torch.allclose(student_t[0, col], exp[0], atol=1e-6)
-
-
 def test_collect_rejected_draft_reverse_token_topk_reverse_kl_postreject():
     # Mixed 3-way routing: reject_token=reverse_kl, post_reject=topk_reverse_kl -> reverse-data slot + two
     # top-K reverse-KL slots (student channel = the in-model reverse KL vs the realized teacher; teacher 0).
@@ -524,7 +482,7 @@ def _reject_cfg(reject_token_mode, post_reject_mode, decay):
         response_loss_mode="bernoulli_fkl", reject_accept_loss_mode="bernoulli_fkl",
         reject_token_loss_mode=reject_token_mode, post_reject_loss_mode=post_reject_mode,
         rejected_draft_position_decay_enabled=True, rejected_draft_position_decay=decay,
-        response_stream_weight=1.0, rejected_draft_stream_weight=1.0, onpolicy_reverse_enabled=False,
+        response_stream_weight=1.0, rejected_draft_stream_weight=1.0,
     )
 
 
@@ -631,3 +589,79 @@ def test_topk_reverse_kl_requires_student_k_for_d_coverage():
     DistillationLossConfig(post_reject_loss_mode="topk_reverse_kl", topk_fkl_teacher_k=8, topk_fkl_student_k=8)
     # default (no topk_reverse_kl) is unaffected even with student_k=0.
     DistillationLossConfig(topk_fkl_student_k=0)
+
+
+def _nested_logprobs(vals):
+    v = torch.as_tensor(vals, dtype=torch.float32).reshape(-1, 1)
+    return torch.nested.as_nested_tensor([v], layout=torch.jagged)
+
+
+def _split_reject_loss(*, reverse_values, is_reject_token, reverse_weight, post_reject_weight):
+    # Tag each reject slot (reject-token vs post-reject) and give the two an INDEPENDENT stream weight via
+    # post_reject_stream_weight. No decay -> each slot's position weight is 1.
+    data = TensorDict(
+        {
+            "prompts": torch.tensor([[1]]),
+            "responses": torch.tensor([[2, 3, 4]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1]]),
+            "response_mask": torch.tensor([[1, 1, 1]]),
+            "teacher_logprobs": _nested_logprobs([0.0, 0.0, 0.0, 0.0]),
+        },
+        batch_size=[1],
+    )
+    resp_fwd = torch.tensor([0.10, 0.20, 0.30, 0.0])
+    mask = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    rev = torch.tensor([reverse_values])
+    model_output = {
+        "log_probs": resp_fwd,
+        "opd_loss_mask": mask,
+        "opd_rejected_draft_student_log_probs": rev,
+        "opd_rejected_draft_teacher_log_probs": torch.zeros_like(rev),
+        "opd_rejected_draft_loss_mask": torch.ones_like(rev, dtype=torch.bool),
+        "opd_rejected_draft_is_reject_token": torch.tensor([is_reject_token], dtype=torch.bool),
+    }
+    cfg = SimpleNamespace(
+        loss_mode="k3", loss_max_clamp=None, log_prob_min_clamp=None, use_policy_gradient=False,
+        reverse_kl_weight=0.0, forward_kl_weight=1.0,
+        response_loss_mode="topk_fkl", reject_accept_loss_mode="topk_fkl",
+        reject_token_loss_mode="topk_reverse_kl", post_reject_loss_mode="topk_reverse_kl",
+        topk_fkl_student_k=8, topk_fkl_teacher_k=8,
+        rejected_draft_position_decay_enabled=False, rejected_draft_position_decay=0.5,
+        response_stream_weight=1.0, rejected_draft_stream_weight=reverse_weight,
+        post_reject_stream_weight=post_reject_weight,
+    )
+    config = SimpleNamespace(
+        loss_agg_mode="token-mean",
+        global_batch_info={"batch_num_tokens": 3.0, "opd_rejected_draft_batch_num_tokens": 99.0, "dp_size": 1},
+    )
+    loss, _ = distillation_loss(config, SimpleNamespace(distillation_loss=cfg), model_output, data, dp_group=None)
+    return loss, resp_fwd[:3]
+
+
+def test_post_reject_split_drops_reverse_when_weight_zero():
+    # reverse (reject-token) weight 0 + post-reject weight 1 -> the reject-token slot (0.11) drops out of BOTH
+    # numerator and denominator; only response + post-reject remain -> each block position scored exactly once.
+    rev = [0.11, 0.22, 0.33]
+    is_rt = [True, False, False]  # slot 0 = reject-token (reverse stream); slots 1,2 = post-reject stream
+    loss, fwd = _split_reject_loss(reverse_values=rev, is_reject_token=is_rt, reverse_weight=0.0, post_reject_weight=1.0)
+    expected = (fwd.sum() + (0.22 + 0.33)) / (1.0 * 3.0 + 1.0 * 2.0)
+    assert torch.allclose(loss, expected, atol=1e-6)
+
+
+def test_post_reject_split_independent_weights():
+    # reverse weight 2, post-reject weight 1 -> 3-term weighted average with separate denominators.
+    rev = [0.11, 0.22, 0.33]
+    is_rt = [True, False, False]
+    loss, fwd = _split_reject_loss(reverse_values=rev, is_reject_token=is_rt, reverse_weight=2.0, post_reject_weight=1.0)
+    num = fwd.sum() + 2.0 * 0.11 + 1.0 * (0.22 + 0.33)
+    denom = 1.0 * 3.0 + 2.0 * 1.0 + 1.0 * 2.0
+    assert torch.allclose(loss, num / denom, atol=1e-6)
+
+
+def test_post_reject_inherit_matches_single_stream():
+    # post_reject_stream_weight<0 (inherit) -> reverse + post-reject collapse to ONE stream (pre-split combine).
+    rev = [0.11, 0.22, 0.33]
+    is_rt = [True, False, False]
+    loss, fwd = _split_reject_loss(reverse_values=rev, is_reject_token=is_rt, reverse_weight=1.0, post_reject_weight=-1.0)
+    expected = (fwd.sum() + sum(rev)) / (1.0 * 3.0 + 1.0 * 3.0)
+    assert torch.allclose(loss, expected, atol=1e-6)

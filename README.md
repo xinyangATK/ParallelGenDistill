@@ -98,8 +98,6 @@ bash verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh
 Useful DFlash-specific options:
 
 - `DFLASH_LM_HEAD_CHUNK_SIZE`: LM-head chunk size, default `512`.
-- `RANDOM_RESPONSE_ANCHOR_ENABLED`: enable random response-anchor ablation, default `False`.
-- `RANDOM_RESPONSE_ANCHOR_SEED`: random-anchor seed, default `42`.
 - `TEACHER_GPU_MEMORY_UTILIZATION`: teacher inference memory fraction, default `0.1`.
 
 Checkpoints are saved under:
